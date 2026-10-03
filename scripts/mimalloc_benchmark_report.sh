@@ -4,7 +4,8 @@ set -euo pipefail
 output_dir="${MIMALLOC_BENCH_OUTPUT_DIR:-target/mimalloc-benchmark}"
 report_path="${MIMALLOC_BENCH_REPORT:-${output_dir}/mimalloc-benchmark-report.md}"
 history_dir="${MIMALLOC_BENCH_HISTORY_DIR:-${output_dir}/history}"
-history_path="${MIMALLOC_BENCH_HISTORY:-${history_dir}/mimalloc-benchmark-history.csv}"
+history_path="${MIMALLOC_BENCH_HISTORY:-${history_dir}/mimalloc-benchmark-history-v2.csv}"
+history_header="timestamp_utc,run_id,run_attempt,commit,scenario,sample_interval_bytes,mib_per_sec,allocations_per_sec,overhead_vs_baseline_pct,recorded_samples,flushes,dropped_samples,report_elapsed_ms,encoded_pprof_bytes,pprof_encode_elapsed_us,allocation_latency_p50_ns,allocation_latency_p95_ns,allocation_latency_p99_ns,status,latency_sampling_policy,allocation_latency_samples,allocation_latency_min_size,allocation_latency_max_size"
 enforce_thresholds="${MIMALLOC_BENCH_ENFORCE_THRESHOLDS:-0}"
 
 : "${MIMALLOC_BENCH_DURATION_MS:=3000}"
@@ -37,11 +38,14 @@ fi
 
 ensure_history_header() {
     if [ -f "$history_path" ]; then
+        if ! IFS= read -r existing_header < "$history_path" || [ "$existing_header" != "$history_header" ]; then
+            echo "incompatible benchmark history schema: $history_path; use a new v2 history file" >&2
+            exit 1
+        fi
         return
     fi
 
-    echo "timestamp_utc,run_id,run_attempt,commit,scenario,sample_interval_bytes,mib_per_sec,allocations_per_sec,overhead_vs_baseline_pct,recorded_samples,flushes,dropped_samples,report_elapsed_ms,encoded_pprof_bytes,pprof_encode_elapsed_us,allocation_latency_p50_ns,allocation_latency_p95_ns,allocation_latency_p99_ns,status" \
-        > "$history_path"
+    echo "$history_header" > "$history_path"
 }
 
 metric() {
@@ -111,6 +115,10 @@ append_row() {
     local allocation_latency_p50_ns
     local allocation_latency_p95_ns
     local allocation_latency_p99_ns
+    local latency_sampling_policy
+    local allocation_latency_samples
+    local allocation_latency_min_size
+    local allocation_latency_max_size
 
     sample_interval="$(metric_or_default "$file" sample_interval_bytes "-")"
     mib_per_sec="$(metric "$file" mib_per_sec)"
@@ -124,6 +132,10 @@ append_row() {
     allocation_latency_p50_ns="$(metric_or_default "$file" allocation_latency_p50_ns "-")"
     allocation_latency_p95_ns="$(metric_or_default "$file" allocation_latency_p95_ns "-")"
     allocation_latency_p99_ns="$(metric_or_default "$file" allocation_latency_p99_ns "-")"
+    latency_sampling_policy="$(metric "$file" latency_sampling_policy)"
+    allocation_latency_samples="$(metric "$file" allocation_latency_samples)"
+    allocation_latency_min_size="$(metric "$file" allocation_latency_min_size)"
+    allocation_latency_max_size="$(metric "$file" allocation_latency_max_size)"
 
     if [ "$scenario" = "baseline" ]; then
         overhead="0.00"
@@ -157,7 +169,7 @@ append_row() {
         "$allocation_latency_p99_ns" \
         "$status" >> "$report_path"
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$history_timestamp" \
         "$history_run_id" \
         "$history_run_attempt" \
@@ -176,9 +188,14 @@ append_row() {
         "$allocation_latency_p50_ns" \
         "$allocation_latency_p95_ns" \
         "$allocation_latency_p99_ns" \
-        "$status" >> "$history_path"
+        "$status" \
+        "$latency_sampling_policy" \
+        "$allocation_latency_samples" \
+        "$allocation_latency_min_size" \
+        "$allocation_latency_max_size" >> "$history_path"
 }
 
+ensure_history_header
 run_baseline
 run_inactive
 run_active active-1m 1048576
@@ -190,7 +207,6 @@ run_active live-4k 4096 live
 
 failures=0
 baseline_mib_per_sec="$(metric "${output_dir}/baseline.env" mib_per_sec)"
-ensure_history_header
 
 {
     echo "# Mimalloc Benchmark Report"
@@ -243,10 +259,13 @@ append_row "live-4k" "${output_dir}/live-4k.env" "$baseline_mib_per_sec" "" "DIA
     echo "- live-1m.env"
     echo "- live-512k.env"
     echo "- live-4k.env"
-    echo "- history/mimalloc-benchmark-history.csv"
+    echo "- history/mimalloc-benchmark-history-v2.csv"
     echo
     echo "Live heap raw outputs include live_samples, dropped_live_samples, and live_metadata_payload_bytes."
     echo "Payload bytes exclude hash control bytes, shard headers, and allocator bookkeeping."
+    echo "Latency samples use stratified_v1: one pseudorandom allocation per window."
+    echo "Raw outputs and v2 history record sample counts and sampled size ranges."
+    echo "Legacy history files are preserved; their fixed-cadence percentiles are not directly comparable."
 } >> "$report_path"
 
 cat "$report_path"

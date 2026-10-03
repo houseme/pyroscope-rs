@@ -117,6 +117,13 @@ preallocated metadata payload bytes (excluding hash control bytes, shard
 headers, and allocator bookkeeping). Benchmark warnings are diagnostic;
 performance claims require repeat runs on an otherwise idle machine.
 
+Latency sampling selects one pseudorandom allocation per window, covering the
+workload's size distribution instead of repeatedly timing the smallest size.
+Raw outputs include the sampling policy, sample count, and sampled size range.
+New history rows use `history/mimalloc-benchmark-history-v2.csv`; existing
+history files are retained. Earlier fixed-cadence latency percentiles should
+not be compared directly with the new stratified measurements.
+
 ### Major Contributors
 
 We'd like to give a big thank you to the following contributors who have made significant contributions to this project:
