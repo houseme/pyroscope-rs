@@ -46,6 +46,24 @@ mod tests {
             })
             .expect("retained allocation symbol");
         assert!(expected.string_table[function.filename as usize].ends_with("mimalloc_backend.rs"));
+        assert!(!expected.string_table[function.system_name as usize].is_empty());
+        let profiler_frames: Vec<_> = expected
+            .function
+            .iter()
+            .map(|function| &expected.string_table[function.name as usize])
+            .filter(|name| {
+                let owner = name.strip_prefix('<').unwrap_or(name);
+                owner.starts_with("pyroscope::backend::mimalloc::")
+                    || owner.starts_with("backtrace::")
+                    || name.contains("pyroscope::backend::mimalloc::SamplerState>")
+                    || name.contains("pyroscope::backend::mimalloc::RegisteredTlsSampleBuffer>")
+                    || name.contains("pyroscope[")
+            })
+            .collect();
+        assert!(
+            profiler_frames.is_empty(),
+            "unexpected profiler frames: {profiler_frames:?}"
+        );
         assert!(expected.location.iter().any(|location| {
             location.address != 0
                 && location

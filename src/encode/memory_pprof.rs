@@ -46,8 +46,10 @@ impl AllocationSample {
 /// A symbol at an instruction address, including an optional source location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemorySymbol {
-    /// Demangled function name or an instruction-address fallback.
+    /// Demangled function name without Rust hash/disambiguator decorations.
     pub name: String,
+    /// Original symbol name when provided by the resolver, before demangling.
+    pub system_name: Option<String>,
     /// Source file when debug information is available.
     pub filename: Option<String>,
     /// Source line, or zero when unknown.
@@ -59,7 +61,7 @@ pub struct MemorySymbol {
 pub struct MemoryFrame {
     /// Runtime instruction address; zero for name-only synthetic frames.
     pub address: u64,
-    /// Inline symbols at this address, innermost first.
+    /// Inline symbols at this address, innermost first; empty when unresolved.
     pub symbols: Vec<MemorySymbol>,
 }
 
@@ -70,6 +72,7 @@ impl MemoryFrame {
             address: 0,
             symbols: vec![MemorySymbol {
                 name,
+                system_name: None,
                 filename: None,
                 line: 0,
             }],
@@ -83,10 +86,11 @@ struct LocationKey {
     lines: Vec<Line>,
 }
 
-struct PprofMemoryBuilder {
+struct PprofMemoryBuilder<'a> {
     profile: Profile,
-    strings: HashMap<String, i64>,
-    functions: HashMap<(i64, i64), u64>,
+    // Keys borrow immutable inputs; only the protobuf string table owns a copy.
+    strings: HashMap<&'a str, i64>,
+    functions: HashMap<(i64, i64, i64), u64>,
     locations: HashMap<LocationKey, u64>,
     // Keep an owning reference so identity-cache addresses cannot be reused.
     frames: HashMap<usize, (Arc<MemoryFrame>, u64)>,
@@ -96,7 +100,7 @@ struct PprofMemoryBuilder {
     live_heap: bool,
 }
 
-impl PprofMemoryBuilder {
+impl<'a> PprofMemoryBuilder<'a> {
     fn new(period: i64, duration_nanos: i64, live_heap: bool) -> Self {
         let mut builder = Self {
             profile: Profile {
@@ -163,7 +167,7 @@ impl PprofMemoryBuilder {
         builder
     }
 
-    fn add_mappings(&mut self, mappings: &[MemoryMapping]) {
+    fn add_mappings(&mut self, mappings: &'a [MemoryMapping]) {
         for mapping in mappings {
             if mapping.memory_start >= mapping.memory_limit {
                 continue;
@@ -199,33 +203,26 @@ impl PprofMemoryBuilder {
         (address < limit).then_some(mapping)
     }
 
-    fn add_string(&mut self, value: &str) -> i64 {
+    fn add_string(&mut self, value: &'a str) -> i64 {
         if let Some(id) = self.strings.get(value) {
             return *id;
         }
 
         let id = self.profile.string_table.len() as i64;
-        self.strings.insert(value.to_owned(), id);
+        self.strings.insert(value, id);
         self.profile.string_table.push(value.to_owned());
         id
     }
 
-    fn add_frame(&mut self, frame: &Arc<MemoryFrame>) -> u64 {
+    fn add_frame(&mut self, frame: &'a Arc<MemoryFrame>) -> u64 {
         let identity = Arc::as_ptr(frame) as usize;
         if let Some((_, location_id)) = self.frames.get(&identity) {
             return *location_id;
         }
         let mapping_id = self.mapping_index(frame.address).map_or(0, |index| {
             let symbols = &frame.symbols;
-            let has_functions = !symbols.is_empty()
-                && symbols.iter().all(|symbol| {
-                    !symbol.name.is_empty()
-                        && symbol
-                            .name
-                            .strip_prefix("0x")
-                            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-                            != Some(frame.address)
-                });
+            let has_functions =
+                !symbols.is_empty() && symbols.iter().all(|symbol| !symbol.name.is_empty());
             let has_filenames = has_functions
                 && symbols.iter().all(|symbol| {
                     symbol
@@ -254,22 +251,30 @@ impl PprofMemoryBuilder {
             .iter()
             .map(|symbol| {
                 let name = self.add_string(&symbol.name);
+                let system_name = symbol
+                    .system_name
+                    .as_deref()
+                    .map(|name| self.add_string(name))
+                    .unwrap_or(0);
                 let filename = symbol
                     .filename
                     .as_deref()
                     .map(|file| self.add_string(file))
                     .unwrap_or(0);
-                let function_id = *self.functions.entry((name, filename)).or_insert_with(|| {
-                    let id = self.profile.function.len() as u64 + 1;
-                    self.profile.function.push(Function {
-                        id,
-                        name,
-                        filename,
-                        system_name: 0,
-                        start_line: 0,
+                let function_id = *self
+                    .functions
+                    .entry((name, system_name, filename))
+                    .or_insert_with(|| {
+                        let id = self.profile.function.len() as u64 + 1;
+                        self.profile.function.push(Function {
+                            id,
+                            name,
+                            filename,
+                            system_name,
+                            start_line: 0,
+                        });
+                        id
                     });
-                    id
-                });
                 Line {
                     function_id,
                     line: symbol.line,
@@ -296,7 +301,7 @@ impl PprofMemoryBuilder {
         location_id
     }
 
-    fn add_sample(&mut self, sample: &AllocationSample) {
+    fn add_sample(&mut self, sample: &'a AllocationSample) {
         if sample.alloc_space <= 0 && (!self.live_heap || sample.inuse_space <= 0) {
             return;
         }
@@ -446,11 +451,13 @@ mod tests {
             symbols: vec![
                 MemorySymbol {
                     name: "allocate".into(),
+                    system_name: None,
                     filename: Some("allocator.rs".into()),
                     line: 17,
                 },
                 MemorySymbol {
                     name: "caller".into(),
+                    system_name: None,
                     filename: Some("app.rs".into()),
                     line: 29,
                 },
@@ -460,6 +467,7 @@ mod tests {
             address: 0x5678,
             symbols: vec![MemorySymbol {
                 name: "allocate".into(),
+                system_name: None,
                 filename: Some("other.rs".into()),
                 line: 5,
             }],
@@ -539,11 +547,13 @@ mod tests {
             symbols: vec![
                 MemorySymbol {
                     name: "allocate".into(),
+                    system_name: None,
                     filename: Some("allocator.rs".into()),
                     line: 17,
                 },
                 MemorySymbol {
                     name: "caller".into(),
+                    system_name: None,
                     filename: Some("app.rs".into()),
                     line: 29,
                 },
@@ -555,11 +565,7 @@ mod tests {
             inline,
             Arc::new(MemoryFrame {
                 address: 0x1000,
-                symbols: vec![MemorySymbol {
-                    name: "0x1000".into(),
-                    filename: None,
-                    line: 0,
-                }],
+                symbols: Vec::new(),
             }),
             Arc::new(MemoryFrame {
                 address: 0x2000,
@@ -618,6 +624,7 @@ mod tests {
                 address: 0x1010,
                 symbols: vec![MemorySymbol {
                     name: "allocate".into(),
+                    system_name: None,
                     filename: Some("allocator.rs".into()),
                     line: 17,
                 }],
@@ -631,5 +638,91 @@ mod tests {
         let profile = Profile::decode(bytes.as_slice()).unwrap();
         let mapping = &profile.mapping[0];
         assert!(!mapping.has_functions && !mapping.has_filenames && !mapping.has_line_numbers);
+    }
+
+    #[test]
+    fn raw_symbol_names_disambiguate_equal_display_names() {
+        let mut sample = AllocationSample::new(Vec::new(), 1, 512);
+        sample.frames = [
+            "_ZN4demo3run17h1111111111111111E",
+            "_ZN4demo3run17h2222222222222222E",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            Arc::new(MemoryFrame {
+                address: 0x1000 + index as u64,
+                symbols: vec![MemorySymbol {
+                    name: "demo::run".into(),
+                    system_name: Some(raw.into()),
+                    filename: Some("demo.rs".into()),
+                    line: 17,
+                }],
+            })
+        })
+        .collect();
+        let profile =
+            Profile::decode(encode_allocation_profile(&[sample], 1024, 0).as_slice()).unwrap();
+        assert_eq!(profile.function.len(), 2);
+        assert_eq!(profile.function[0].name, profile.function[1].name);
+        assert_ne!(
+            profile.function[0].system_name,
+            profile.function[1].system_name
+        );
+        assert_eq!(
+            profile.string_table[profile.function[0].system_name as usize],
+            "_ZN4demo3run17h1111111111111111E"
+        );
+    }
+
+    #[test]
+    fn unresolved_addresses_do_not_create_fake_functions_or_lines() {
+        let mut sample = AllocationSample::new(Vec::new(), 1, 512);
+        sample.frames = vec![Arc::new(MemoryFrame {
+            address: 0x1010,
+            symbols: Vec::new(),
+        })];
+        let mappings = [MemoryMapping {
+            memory_start: 0x1000,
+            memory_limit: 0x2000,
+            file_offset: 0,
+            filename: "app".into(),
+            build_id: "1234".into(),
+        }];
+        let profile = Profile::decode(
+            encode_memory_profile_with_mappings(&[sample], 1024, 0, false, &mappings).as_slice(),
+        )
+        .unwrap();
+        assert!(profile.function.is_empty());
+        assert!(profile.location[0].line.is_empty());
+        assert_eq!(profile.location[0].address, 0x1010);
+        assert_eq!(profile.location[0].mapping_id, 1);
+        assert!(!profile.mapping[0].has_functions);
+        assert!(!profile.string_table.iter().any(|name| name == "0x1010"));
+    }
+
+    #[test]
+    fn encoded_strings_remain_owned_after_borrowed_inputs_are_dropped() {
+        let bytes = {
+            let mut sample = AllocationSample::new(Vec::new(), 1, 512);
+            sample.frames = vec![Arc::new(MemoryFrame {
+                address: 0x1010,
+                symbols: vec![MemorySymbol {
+                    name: "demo::run".into(),
+                    system_name: Some("_ZN4demo3runE".into()),
+                    filename: Some("demo.rs".into()),
+                    line: 17,
+                }],
+            })];
+            encode_allocation_profile(&[sample], 1024, 0)
+        };
+        let profile = Profile::decode(bytes.as_slice()).unwrap();
+        let function = &profile.function[0];
+        assert_eq!(profile.string_table[function.name as usize], "demo::run");
+        assert_eq!(
+            profile.string_table[function.system_name as usize],
+            "_ZN4demo3runE"
+        );
+        assert_eq!(profile.string_table[function.filename as usize], "demo.rs");
     }
 }

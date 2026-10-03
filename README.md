@@ -82,7 +82,12 @@ no-ops, as in the jemalloc backend; agent-wide tags remain supported.
 
 Memory pprof locations retain instruction addresses and inline call chains.
 Function filenames and source lines are included when debug information is
-available. To retain source information in optimized builds:
+available. Rust display names omit hash/disambiguator decorations, while
+`Function.system_name` preserves the original symbol for re-demangling. Profiler
+frames are filtered once per resolved address and shared across stacks.
+Unresolved addresses keep an empty location line table, allowing downstream
+symbolizers to fill them without mistaking an address string for a function.
+To retain source information in optimized builds:
 
 ```toml
 [profile.release]

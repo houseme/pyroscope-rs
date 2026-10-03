@@ -1444,6 +1444,15 @@ fn build_memory_samples(
     live_samples: Vec<live::LiveAllocationSample>,
     max_depth: usize,
 ) -> Vec<AllocationSample> {
+    build_memory_samples_with_resolver(recorded, live_samples, max_depth, resolve_frame)
+}
+
+fn build_memory_samples_with_resolver(
+    recorded: Vec<RecordedAllocationSample>,
+    live_samples: Vec<live::LiveAllocationSample>,
+    max_depth: usize,
+    mut resolve: impl FnMut(usize) -> MemoryFrame,
+) -> Vec<AllocationSample> {
     let mut aggregated: HashMap<StackKey, AggregatedAllocationSample> = HashMap::new();
     for sample in recorded {
         let entry = aggregated.entry(sample.stack).or_default();
@@ -1458,7 +1467,7 @@ fn build_memory_samples(
 
     // Stacks commonly share most instruction pointers. Resolve each address
     // once per report, without retaining stale symbols across dynamic unloads.
-    let mut frame_cache: HashMap<usize, Arc<MemoryFrame>> = HashMap::new();
+    let mut frame_cache: HashMap<usize, Option<Arc<MemoryFrame>>> = HashMap::new();
 
     aggregated
         .into_iter()
@@ -1466,7 +1475,7 @@ fn build_memory_samples(
             let frames = resolve_stack_with(&stack, max_depth, |ip| {
                 frame_cache
                     .entry(ip)
-                    .or_insert_with(|| Arc::new(resolve_frame(ip)))
+                    .or_insert_with(|| filter_profiler_frame(resolve(ip)).map(Arc::new))
                     .clone()
             });
             AllocationSample {
@@ -1485,7 +1494,7 @@ fn build_memory_samples(
 fn resolve_stack_with(
     stack: &StackKey,
     max_depth: usize,
-    mut resolve: impl FnMut(usize) -> Arc<MemoryFrame>,
+    mut resolve: impl FnMut(usize) -> Option<Arc<MemoryFrame>>,
 ) -> Vec<Arc<MemoryFrame>> {
     let mut frames = Vec::new();
     let mut remaining = max_depth;
@@ -1493,25 +1502,15 @@ fn resolve_stack_with(
         if remaining == 0 {
             break;
         }
-        let frame = resolve(ip);
-        if frame.symbols.is_empty() {
+        let Some(frame) = resolve(ip) else {
             continue;
-        }
-        let needs_filter = frame
-            .symbols
-            .iter()
-            .any(|symbol| is_mimalloc_profiler_frame(&symbol.name));
-        if !needs_filter && frame.symbols.len() <= remaining {
-            remaining -= frame.symbols.len();
+        };
+        let depth = frame.symbols.len().max(1);
+        if depth <= remaining {
+            remaining -= depth;
             frames.push(frame);
         } else {
-            let symbols: Vec<_> = frame
-                .symbols
-                .iter()
-                .filter(|symbol| !is_mimalloc_profiler_frame(&symbol.name))
-                .take(remaining)
-                .cloned()
-                .collect();
+            let symbols: Vec<_> = frame.symbols.iter().take(remaining).cloned().collect();
             if !symbols.is_empty() {
                 remaining -= symbols.len();
                 frames.push(Arc::new(MemoryFrame {
@@ -1529,30 +1528,37 @@ fn resolve_stack_with(
     }
 }
 
+fn filter_profiler_frame(mut frame: MemoryFrame) -> Option<MemoryFrame> {
+    if frame.symbols.is_empty() {
+        // Keep unresolved physical addresses for display and remote symbolization.
+        return (frame.address != 0).then_some(frame);
+    }
+    // Filter once while owning the symbols, then share the result across stacks.
+    // A fully filtered frame is distinct from an unresolved physical address.
+    frame
+        .symbols
+        .retain(|symbol| !is_mimalloc_profiler_frame(&symbol.name));
+    (!frame.symbols.is_empty()).then_some(frame)
+}
+
 fn resolve_frame(ip: usize) -> MemoryFrame {
     // backtrace resolves return addresses at IP - 1 internally. Export the
     // same instruction so offline symbolizers see the call site too.
     let address = ip.saturating_sub(1) as u64;
     let mut resolved = Vec::new();
     backtrace::resolve(ip as *mut std::ffi::c_void, |symbol| {
+        let Some(name) = symbol.name().filter(|name| !name.as_bytes().is_empty()) else {
+            return;
+        };
         resolved.push(MemorySymbol {
-            name: symbol
-                .name()
-                .map(|name| name.to_string())
-                .unwrap_or_else(|| format!("0x{address:x}")),
+            name: format!("{name:#}"),
+            system_name: Some(String::from_utf8_lossy(name.as_bytes()).into_owned()),
             filename: symbol
                 .filename()
                 .map(|path| path.to_string_lossy().into_owned()),
             line: symbol.lineno().map(i64::from).unwrap_or(0),
         });
     });
-    if resolved.is_empty() {
-        resolved.push(MemorySymbol {
-            name: format!("0x{address:x}"),
-            filename: None,
-            line: 0,
-        });
-    }
     MemoryFrame {
         address,
         symbols: resolved,
@@ -1560,9 +1566,19 @@ fn resolve_frame(ip: usize) -> MemoryFrame {
 }
 
 fn is_mimalloc_profiler_frame(name: &str) -> bool {
-    name.contains("pyroscope::backend::mimalloc")
-        || name.contains("pyroscope::encode::memory_pprof")
-        || name.contains("backtrace::")
+    let owner = name.strip_prefix('<').unwrap_or(name);
+    if owner.starts_with("pyroscope::backend::mimalloc::")
+        || owner.starts_with("pyroscope::encode::memory_pprof::")
+        || owner.starts_with("backtrace::")
+    {
+        return true;
+    }
+    // These private TLS types belong to recorder scaffolding. Do not exclude
+    // arbitrary application functions just because a public profiler type
+    // appears among their generic arguments.
+    owner.starts_with("std::thread::local::LocalKey<")
+        && (name.contains("pyroscope::backend::mimalloc::SamplerState>")
+            || name.contains("pyroscope::backend::mimalloc::RegisteredTlsSampleBuffer>"))
 }
 
 fn warm_backtrace() {
@@ -2716,6 +2732,111 @@ mod tests {
     }
 
     #[test]
+    fn rust_symbol_normalization_removes_hashes_before_profiler_filtering() {
+        let names: &[&[u8]] = &[
+            b"_ZN9pyroscope7backend8mimalloc13record_sample17h0123456789abcdefE",
+            b"_RNvNtNtCs4fqI2P2rA04_9pyroscope7backend8mimalloc13record_sample",
+        ];
+        for raw in names {
+            let symbol = backtrace::SymbolName::new(raw);
+            let display = format!("{symbol:#}");
+            assert_eq!(display, "pyroscope::backend::mimalloc::record_sample");
+            assert!(is_mimalloc_profiler_frame(&display));
+            assert_eq!(symbol.as_bytes(), *raw);
+        }
+    }
+
+    #[test]
+    fn profiler_filter_preserves_application_functions_with_public_profiler_type_arguments() {
+        for name in [
+            "application::store::<pyroscope::backend::mimalloc::MimallocConfig>",
+            "<application::Store<pyroscope::backend::mimalloc::SamplingMiMalloc> as application::Trait>::reserve",
+            "<alloc::vec::Vec<pyroscope::backend::mimalloc::MimallocConfig>>::reserve",
+            "application::inspect::<backtrace::Backtrace>",
+            "std::sys::backtrace::__rust_begin_short_backtrace::<application::run, ()>",
+            "test::__rust_begin_short_backtrace::<core::result::Result<(), ()>, application::run>",
+        ] {
+            assert!(!is_mimalloc_profiler_frame(name), "application frame removed: {name}");
+        }
+        assert!(is_mimalloc_profiler_frame("<pyroscope::backend::mimalloc::SamplingMiMalloc as core::alloc::global::GlobalAlloc>::alloc"));
+        assert!(is_mimalloc_profiler_frame("<std::thread::local::LocalKey<core::cell::Cell<pyroscope::backend::mimalloc::SamplerState>>>::try_with"));
+        assert!(is_mimalloc_profiler_frame("<std::thread::local::LocalKey<pyroscope::backend::mimalloc::RegisteredTlsSampleBuffer>>::try_with"));
+    }
+
+    #[test]
+    fn filtered_inline_frames_are_shared_and_resolved_once_per_report() {
+        let mut first = StackKey {
+            frames: [0; MAX_CAPTURE_DEPTH],
+            depth: 2,
+        };
+        first.frames[..2].copy_from_slice(&[1, 2]);
+        let mut second = first;
+        second.frames[1] = 3;
+        let recorded = [first, second]
+            .into_iter()
+            .map(|stack| RecordedAllocationSample {
+                stack,
+                weighted_objects: 1,
+                weighted_bytes: 1024,
+            })
+            .collect();
+        let mut resolutions = HashMap::<usize, usize>::new();
+        let samples = build_memory_samples_with_resolver(recorded, Vec::new(), 64, |ip| {
+            *resolutions.entry(ip).or_default() += 1;
+            let names = if ip == 1 {
+                vec![
+                    "pyroscope::backend::mimalloc::record_sample",
+                    "example::allocate",
+                    "example::caller",
+                ]
+            } else {
+                vec!["example::root"]
+            };
+            MemoryFrame {
+                address: ip as u64,
+                symbols: names
+                    .into_iter()
+                    .map(|name| MemorySymbol {
+                        name: name.into(),
+                        system_name: None,
+                        filename: None,
+                        line: 0,
+                    })
+                    .collect(),
+            }
+        });
+        assert_eq!(resolutions, HashMap::from([(1, 1), (2, 1), (3, 1)]));
+        assert_eq!(samples.len(), 2);
+        assert!(Arc::ptr_eq(&samples[0].frames[0], &samples[1].frames[0]));
+        assert_eq!(samples[0].frames[0].symbols.len(), 2);
+        assert_eq!(samples[0].frames[0].symbols[0].name, "example::allocate");
+    }
+
+    #[test]
+    fn unresolved_addresses_survive_depth_limits_and_profiler_filtering() {
+        let mut stack = StackKey {
+            frames: [0; MAX_CAPTURE_DEPTH],
+            depth: 2,
+        };
+        stack.frames[..2].copy_from_slice(&[7, 8]);
+        let frames = resolve_stack_with(&stack, 1, |ip| {
+            filter_profiler_frame(MemoryFrame {
+                address: ip as u64,
+                symbols: Vec::new(),
+            })
+            .map(Arc::new)
+        });
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].address, 7);
+        assert!(frames[0].symbols.is_empty());
+        assert!(filter_profiler_frame(MemoryFrame {
+            address: 0,
+            symbols: Vec::new()
+        })
+        .is_none());
+    }
+
+    #[test]
     fn resolve_stack_applies_depth_after_profiler_frame_filtering() {
         let mut frames = [0; MAX_CAPTURE_DEPTH];
         frames[..4].copy_from_slice(&[1, 2, 3, 4]);
@@ -2729,14 +2850,16 @@ mod tests {
                 4 => "example::caller",
                 _ => "unknown",
             };
-            Arc::new(MemoryFrame {
+            filter_profiler_frame(MemoryFrame {
                 address: ip as u64,
                 symbols: vec![MemorySymbol {
                     name: name.into(),
+                    system_name: None,
                     filename: None,
                     line: 0,
                 }],
             })
+            .map(Arc::new)
         });
 
         assert_eq!(resolved.len(), 1);
@@ -2752,7 +2875,7 @@ mod tests {
 
         let resolved = resolve_stack_with(&stack, 2, |ip| {
             assert_eq!(ip, 1);
-            Arc::new(MemoryFrame {
+            filter_profiler_frame(MemoryFrame {
                 address: ip as u64,
                 symbols: [
                     "pyroscope::backend::mimalloc::record_sample",
@@ -2762,11 +2885,13 @@ mod tests {
                 .into_iter()
                 .map(|name| MemorySymbol {
                     name: name.into(),
+                    system_name: None,
                     filename: Some("example.rs".into()),
                     line: 42,
                 })
                 .collect(),
             })
+            .map(Arc::new)
         });
 
         assert_eq!(resolved.len(), 1);
