@@ -6,6 +6,9 @@ use pyroscope::{
 };
 use std::collections::HashMap;
 
+#[path = "support/push_receiver.rs"]
+mod push_receiver;
+
 #[test]
 fn test_session_manager_new() {
     let session_manager = SessionManager::new().unwrap();
@@ -58,4 +61,90 @@ fn test_session_send_error() {
     };
 
     let _session = Session::new(1950, config, batch).unwrap();
+}
+
+#[test]
+fn raw_memory_upload_preserves_pprof_auth_tenant_and_agent_labels() {
+    use prost::Message;
+    use pyroscope::encode::{
+        gen::google::Profile,
+        memory_pprof::{encode_memory_profile, AllocationSample},
+    };
+    use std::io::{Read, Write};
+
+    for gzipped_profile in [false, true] {
+        let receiver = push_receiver::PushReceiver::start();
+        let mut config = PyroscopeConfig::new(
+            format!("{}/sdk", receiver.url),
+            "heap-service",
+            100,
+            "test-rs",
+            "test-version",
+        )
+        .basic_auth("test".into(), "secret".into())
+        .tenant_id("test-tenant".into())
+        .tags(vec![("env", "test"), ("__name__", "ignored")]);
+        config
+            .http_headers
+            .insert("X-Test-Header".into(), "upload-test".into());
+        config.func = Some(|_| panic!("raw profile must bypass structured report transforms"));
+        let mut sample = AllocationSample::new(vec!["retained_allocation".into()], 2, 8192);
+        sample.inuse_objects = 1;
+        sample.inuse_space = 4096;
+        let pprof = encode_memory_profile(&[sample], 4096, 10_000, true);
+        let expected = Profile::decode(pprof.as_slice()).unwrap();
+        let payload = if gzipped_profile {
+            let mut encoder = libflate::gzip::Encoder::new(Vec::new()).unwrap();
+            encoder.write_all(&pprof).unwrap();
+            encoder.finish().into_result().unwrap()
+        } else {
+            pprof
+        };
+        let session = Session::new(
+            1950,
+            config,
+            ReportBatch {
+                profile_type: "memory".into(),
+                data: ReportData::RawPprof(payload.clone()),
+            },
+        )
+        .unwrap();
+        let manager = SessionManager::new().unwrap();
+        manager
+            .push(SessionSignal::Session(Box::new(session)))
+            .unwrap();
+        manager.push(SessionSignal::Kill).unwrap();
+        manager.handle.unwrap().join().unwrap().unwrap();
+        let captured = receiver.finish();
+        assert_eq!(captured.path, "/sdk/push.v1.PusherService/Push");
+        assert_eq!(captured.headers["content-type"], "application/proto");
+        assert_eq!(captured.headers["content-encoding"], "gzip");
+        assert_eq!(captured.headers["authorization"], "Basic dGVzdDpzZWNyZXQ=");
+        assert_eq!(captured.headers["x-scope-orgid"], "test-tenant");
+        assert_eq!(captured.headers["x-test-header"], "upload-test");
+        assert!(captured.headers["user-agent"].contains("test-rs/test-version"));
+        let series = &captured.request.series[0];
+        let labels: HashMap<_, _> = series
+            .labels
+            .iter()
+            .map(|label| (label.name.as_str(), label.value.as_str()))
+            .collect();
+        assert_eq!(labels["__name__"], "memory");
+        assert_eq!(labels["service_name"], "heap-service");
+        assert_eq!(labels["env"], "test");
+        assert_eq!(labels["process.runtime.name"], "rust");
+        assert_eq!(series.samples[0].raw_profile, payload);
+        assert!(!series.samples[0].id.is_empty());
+        let restored = if gzipped_profile {
+            let mut decoded = Vec::new();
+            libflate::gzip::Decoder::new(payload.as_slice())
+                .unwrap()
+                .read_to_end(&mut decoded)
+                .unwrap();
+            decoded
+        } else {
+            payload
+        };
+        assert_eq!(Profile::decode(restored.as_slice()).unwrap(), expected);
+    }
 }

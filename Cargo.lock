@@ -1423,6 +1423,7 @@ dependencies = [
  "env_logger",
  "findshlibs",
  "framehop",
+ "httparse",
  "jemalloc_pprof",
  "libc",
  "libflate",

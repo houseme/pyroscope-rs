@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +11,8 @@ use crate::encode::gen::google::{Function, Line, Location, Profile, Sample, Valu
 /// A memory allocation sample ready to be encoded into pprof.
 #[derive(Debug, Clone)]
 pub struct AllocationSample {
-    pub frames: Vec<String>,
+    /// Physical frames in leaf-to-root order, shared across sampled stacks.
+    pub frames: Vec<Arc<MemoryFrame>>,
     pub alloc_objects: i64,
     pub alloc_space: i64,
     pub inuse_objects: i64,
@@ -20,7 +22,10 @@ pub struct AllocationSample {
 impl AllocationSample {
     pub fn new(frames: Vec<String>, alloc_objects: i64, alloc_space: i64) -> Self {
         Self {
-            frames,
+            frames: frames
+                .into_iter()
+                .map(|name| Arc::new(MemoryFrame::named(name)))
+                .collect(),
             alloc_objects,
             alloc_space,
             inuse_objects: 0,
@@ -29,10 +34,53 @@ impl AllocationSample {
     }
 }
 
+/// A symbol at an instruction address, including an optional source location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySymbol {
+    /// Demangled function name or an instruction-address fallback.
+    pub name: String,
+    /// Source file when debug information is available.
+    pub filename: Option<String>,
+    /// Source line, or zero when unknown.
+    pub line: i64,
+}
+
+/// One physical instruction address and its leaf-first inline symbol chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryFrame {
+    /// Runtime instruction address; zero for name-only synthetic frames.
+    pub address: u64,
+    /// Inline symbols at this address, innermost first.
+    pub symbols: Vec<MemorySymbol>,
+}
+
+impl MemoryFrame {
+    /// Create a name-only synthetic frame with no source metadata.
+    pub fn named(name: String) -> Self {
+        Self {
+            address: 0,
+            symbols: vec![MemorySymbol {
+                name,
+                filename: None,
+                line: 0,
+            }],
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct LocationKey {
+    address: u64,
+    lines: Vec<Line>,
+}
+
 struct PprofMemoryBuilder {
     profile: Profile,
     strings: HashMap<String, i64>,
-    locations: HashMap<String, u64>,
+    functions: HashMap<(i64, i64), u64>,
+    locations: HashMap<LocationKey, u64>,
+    // Keep an owning reference so identity-cache addresses cannot be reused.
+    frames: HashMap<usize, (Arc<MemoryFrame>, u64)>,
     live_heap: bool,
 }
 
@@ -56,7 +104,9 @@ impl PprofMemoryBuilder {
                 default_sample_type: 0,
             },
             strings: HashMap::new(),
+            functions: HashMap::new(),
             locations: HashMap::new(),
+            frames: HashMap::new(),
             live_heap,
         };
 
@@ -110,36 +160,55 @@ impl PprofMemoryBuilder {
         id
     }
 
-    fn add_frame(&mut self, name: &str) -> u64 {
-        if let Some(location_id) = self.locations.get(name) {
+    fn add_frame(&mut self, frame: &Arc<MemoryFrame>) -> u64 {
+        let identity = Arc::as_ptr(frame) as usize;
+        if let Some((_, location_id)) = self.frames.get(&identity) {
             return *location_id;
         }
-
-        let name_id = self.add_string(name);
-        // Each unique frame name has one location and one function. The
-        // location lookup above already handles reuse; a second map duplicates
-        // its keys and lookups without distinguishing additional functions.
-        let function_id = self.profile.function.len() as u64 + 1;
-        self.profile.function.push(Function {
-            id: function_id,
-            name: name_id,
-            system_name: 0,
-            filename: 0,
-            start_line: 0,
+        let lines: Vec<_> = frame
+            .symbols
+            .iter()
+            .map(|symbol| {
+                let name = self.add_string(&symbol.name);
+                let filename = symbol
+                    .filename
+                    .as_deref()
+                    .map(|file| self.add_string(file))
+                    .unwrap_or(0);
+                let function_id = *self.functions.entry((name, filename)).or_insert_with(|| {
+                    let id = self.profile.function.len() as u64 + 1;
+                    self.profile.function.push(Function {
+                        id,
+                        name,
+                        filename,
+                        system_name: 0,
+                        start_line: 0,
+                    });
+                    id
+                });
+                Line {
+                    function_id,
+                    line: symbol.line,
+                }
+            })
+            .collect();
+        let key = LocationKey {
+            address: frame.address,
+            lines,
+        };
+        let location_id = *self.locations.entry(key).or_insert_with_key(|key| {
+            let id = self.profile.location.len() as u64 + 1;
+            self.profile.location.push(Location {
+                id,
+                mapping_id: 0,
+                address: key.address,
+                line: key.lines.clone(),
+                is_folded: false,
+            });
+            id
         });
-
-        let location_id = self.profile.location.len() as u64 + 1;
-        self.profile.location.push(Location {
-            id: location_id,
-            mapping_id: 0,
-            address: 0,
-            line: vec![Line {
-                function_id,
-                line: 0,
-            }],
-            is_folded: false,
-        });
-        self.locations.insert(name.to_owned(), location_id);
+        self.frames
+            .insert(identity, (Arc::clone(frame), location_id));
         location_id
     }
 
@@ -154,7 +223,8 @@ impl PprofMemoryBuilder {
             .map(|frame| self.add_frame(frame))
             .collect();
 
-        let mut value = vec![sample.alloc_objects, sample.alloc_space];
+        let mut value = Vec::with_capacity(if self.live_heap { 4 } else { 2 });
+        value.extend([sample.alloc_objects, sample.alloc_space]);
         if self.live_heap {
             value.extend([sample.inuse_objects, sample.inuse_space]);
         }
@@ -272,5 +342,82 @@ mod tests {
         assert_eq!(profile.sample[0].value, [0, 0, 3, 8192]);
         assert_eq!(profile.period, 4096);
         assert_eq!(profile.duration_nanos, 42);
+    }
+
+    #[test]
+    fn locations_preserve_addresses_inline_lines_and_distinct_source_functions() {
+        let frame = Arc::new(MemoryFrame {
+            address: 0x1234,
+            symbols: vec![
+                MemorySymbol {
+                    name: "allocate".into(),
+                    filename: Some("allocator.rs".into()),
+                    line: 17,
+                },
+                MemorySymbol {
+                    name: "caller".into(),
+                    filename: Some("app.rs".into()),
+                    line: 29,
+                },
+            ],
+        });
+        let other = Arc::new(MemoryFrame {
+            address: 0x5678,
+            symbols: vec![MemorySymbol {
+                name: "allocate".into(),
+                filename: Some("other.rs".into()),
+                line: 5,
+            }],
+        });
+        let same_function = Arc::new(MemoryFrame {
+            address: 0x1240,
+            symbols: vec![frame.symbols[0].clone()],
+        });
+        let mut sample = AllocationSample::new(Vec::new(), 1, 4096);
+        sample.frames = vec![Arc::clone(&frame), Arc::clone(&frame), other, same_function];
+        let bytes = encode_allocation_profile(&[sample], 4096, 0);
+        let profile = Profile::decode(bytes.as_slice()).unwrap();
+        assert_eq!(profile.location.len(), 3);
+        assert_eq!(profile.function.len(), 3);
+        assert_eq!(
+            profile.sample[0].location_id[0],
+            profile.sample[0].location_id[1]
+        );
+        let inline = profile
+            .location
+            .iter()
+            .find(|location| location.address == 0x1234)
+            .unwrap();
+        assert_eq!(inline.line.len(), 2);
+        assert_eq!(inline.line[0].line, 17);
+        assert_eq!(inline.line[1].line, 29);
+        let function = profile
+            .function
+            .iter()
+            .find(|function| function.id == inline.line[0].function_id)
+            .unwrap();
+        assert_eq!(profile.string_table[function.name as usize], "allocate");
+        assert_eq!(
+            profile.string_table[function.filename as usize],
+            "allocator.rs"
+        );
+        let same = profile
+            .location
+            .iter()
+            .find(|location| location.address == 0x1240)
+            .unwrap();
+        assert_eq!(same.line[0].function_id, function.id);
+    }
+
+    #[test]
+    fn equivalent_distinct_frame_objects_share_a_location() {
+        let first = Arc::new(MemoryFrame::named("allocate".into()));
+        let second = Arc::new((*first).clone());
+        let mut sample = AllocationSample::new(Vec::new(), 1, 512);
+        sample.frames = vec![first, second];
+        let profile =
+            Profile::decode(encode_allocation_profile(&[sample], 1024, 0).as_slice()).unwrap();
+        assert_eq!(profile.location.len(), 1);
+        assert_eq!(profile.function.len(), 1);
     }
 }

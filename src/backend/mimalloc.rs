@@ -25,7 +25,7 @@ use rustfs_mimalloc as mimalloc;
 
 use crate::{
     backend::{Backend, BackendImpl, BackendUninitialized, ReportBatch, ReportData, ThreadTag},
-    encode::memory_pprof::{self, AllocationSample},
+    encode::memory_pprof::{self, AllocationSample, MemoryFrame, MemorySymbol},
     error::{PyroscopeError, Result},
 };
 
@@ -1454,7 +1454,7 @@ fn build_memory_samples(
 
     // Stacks commonly share most instruction pointers. Resolve each address
     // once per report, without retaining stale symbols across dynamic unloads.
-    let mut frame_cache: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut frame_cache: HashMap<usize, Arc<MemoryFrame>> = HashMap::new();
 
     aggregated
         .into_iter()
@@ -1462,7 +1462,7 @@ fn build_memory_samples(
             let frames = resolve_stack_with(&stack, max_depth, |ip| {
                 frame_cache
                     .entry(ip)
-                    .or_insert_with(|| resolve_frame_names(ip))
+                    .or_insert_with(|| Arc::new(resolve_frame(ip)))
                     .clone()
             });
             AllocationSample {
@@ -1481,33 +1481,75 @@ fn build_memory_samples(
 fn resolve_stack_with(
     stack: &StackKey,
     max_depth: usize,
-    resolve: impl FnMut(usize) -> Vec<String>,
-) -> Vec<String> {
-    let frames: Vec<String> = stack
-        .iter()
-        .flat_map(resolve)
-        .filter(|name| !is_mimalloc_profiler_frame(name))
-        .take(max_depth)
-        .collect();
+    mut resolve: impl FnMut(usize) -> Arc<MemoryFrame>,
+) -> Vec<Arc<MemoryFrame>> {
+    let mut frames = Vec::new();
+    let mut remaining = max_depth;
+    for ip in stack.iter() {
+        if remaining == 0 {
+            break;
+        }
+        let frame = resolve(ip);
+        if frame.symbols.is_empty() {
+            continue;
+        }
+        let needs_filter = frame
+            .symbols
+            .iter()
+            .any(|symbol| is_mimalloc_profiler_frame(&symbol.name));
+        if !needs_filter && frame.symbols.len() <= remaining {
+            remaining -= frame.symbols.len();
+            frames.push(frame);
+        } else {
+            let symbols: Vec<_> = frame
+                .symbols
+                .iter()
+                .filter(|symbol| !is_mimalloc_profiler_frame(&symbol.name))
+                .take(remaining)
+                .cloned()
+                .collect();
+            if !symbols.is_empty() {
+                remaining -= symbols.len();
+                frames.push(Arc::new(MemoryFrame {
+                    address: frame.address,
+                    symbols,
+                }));
+            }
+        }
+    }
 
     if frames.is_empty() {
-        vec![SYNTHETIC_FRAME.to_string()]
+        vec![Arc::new(MemoryFrame::named(SYNTHETIC_FRAME.to_string()))]
     } else {
         frames
     }
 }
 
-fn resolve_frame_names(ip: usize) -> Vec<String> {
+fn resolve_frame(ip: usize) -> MemoryFrame {
     let mut resolved = Vec::new();
     backtrace::resolve(ip as *mut std::ffi::c_void, |symbol| {
-        if let Some(name) = symbol.name() {
-            resolved.push(name.to_string());
-        }
+        resolved.push(MemorySymbol {
+            name: symbol
+                .name()
+                .map(|name| name.to_string())
+                .unwrap_or_else(|| format!("0x{ip:x}")),
+            filename: symbol
+                .filename()
+                .map(|path| path.to_string_lossy().into_owned()),
+            line: symbol.lineno().map(i64::from).unwrap_or(0),
+        });
     });
     if resolved.is_empty() {
-        resolved.push(format!("0x{ip:x}"));
+        resolved.push(MemorySymbol {
+            name: format!("0x{ip:x}"),
+            filename: None,
+            line: 0,
+        });
     }
-    resolved
+    MemoryFrame {
+        address: ip as u64,
+        symbols: resolved,
+    }
 }
 
 fn is_mimalloc_profiler_frame(name: &str) -> bool {
@@ -2665,15 +2707,27 @@ mod tests {
         frames[..4].copy_from_slice(&[1, 2, 3, 4]);
         let stack = StackKey { frames, depth: 4 };
 
-        let resolved = resolve_stack_with(&stack, 1, |ip| match ip {
-            1 => vec!["pyroscope::backend::mimalloc::record_sample".to_string()],
-            2 => vec!["backtrace::trace_unsynchronized".to_string()],
-            3 => vec!["example::allocate".to_string()],
-            4 => vec!["example::caller".to_string()],
-            _ => Vec::new(),
+        let resolved = resolve_stack_with(&stack, 1, |ip| {
+            let name = match ip {
+                1 => "pyroscope::backend::mimalloc::record_sample",
+                2 => "backtrace::trace_unsynchronized",
+                3 => "example::allocate",
+                4 => "example::caller",
+                _ => "unknown",
+            };
+            Arc::new(MemoryFrame {
+                address: ip as u64,
+                symbols: vec![MemorySymbol {
+                    name: name.into(),
+                    filename: None,
+                    line: 0,
+                }],
+            })
         });
 
-        assert_eq!(resolved, vec!["example::allocate"]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].address, 3);
+        assert_eq!(resolved[0].symbols[0].name, "example::allocate");
     }
 
     #[test]
@@ -2682,19 +2736,38 @@ mod tests {
         frames[0] = 1;
         let stack = StackKey { frames, depth: 1 };
 
-        let resolved = resolve_stack_with(&stack, 2, |ip| match ip {
-            1 => vec![
-                "pyroscope::backend::mimalloc::record_sample".to_string(),
-                "example::inline_allocate".to_string(),
-                "example::caller".to_string(),
-            ],
-            _ => Vec::new(),
+        let resolved = resolve_stack_with(&stack, 2, |ip| {
+            assert_eq!(ip, 1);
+            Arc::new(MemoryFrame {
+                address: ip as u64,
+                symbols: [
+                    "pyroscope::backend::mimalloc::record_sample",
+                    "example::inline_allocate",
+                    "example::caller",
+                ]
+                .into_iter()
+                .map(|name| MemorySymbol {
+                    name: name.into(),
+                    filename: Some("example.rs".into()),
+                    line: 42,
+                })
+                .collect(),
+            })
         });
 
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].address, 1);
+        let names: Vec<_> = resolved[0]
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.as_str())
+            .collect();
+        assert_eq!(names, ["example::inline_allocate", "example::caller"]);
         assert_eq!(
-            resolved,
-            vec!["example::inline_allocate", "example::caller"]
+            resolved[0].symbols[0].filename.as_deref(),
+            Some("example.rs")
         );
+        assert_eq!(resolved[0].symbols[0].line, 42);
     }
 
     #[test]

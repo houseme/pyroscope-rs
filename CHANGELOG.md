@@ -6,6 +6,7 @@
 
 - **Mimalloc memory profiling backend** — new `backend-mimalloc` feature flag enables allocation memory profiling with `SamplingMiMalloc`, sampled allocation call stacks, memory pprof output, recorder counters, overhead examples, benchmark artifacts, and optional release-validation stress tests.
 - Add opt-in mimalloc live heap profiles (`inuse_objects` / `inuse_space`) with bounded sampled-pointer tracking, cross-thread deallocation, realloc failure rollback, and live metadata diagnostics. Reject missing sampling allocators and concurrent mimalloc backend instances. Skip stack capture when the allocation recorder is full, cache repeated frame resolution per report, and drain preallocated FIFO shards without moving the remaining backlog.
+- Preserve instruction addresses, inline symbol chains, filenames, and source lines in mimalloc memory pprof. Share resolved frames across stacks and validate memory uploads through loopback HTTP, including gzip profiles, authentication, tenant headers, and agent labels.
 
 
 ## [2.1.1](https://github.com/grafana/pyroscope-rs/compare/lib-2.1.0...lib-2.1.1) (2026-07-21)

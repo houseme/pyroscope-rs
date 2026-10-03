@@ -56,6 +56,7 @@ assert_matches = "=1.5.0"
 claims = "=0.8.0"
 tikv-jemallocator = { version = "0.7", features = ["profiling"] }
 env_logger = "=0.11.10"
+httparse = "1"
 
 [[example]]
 name = "jemalloc"

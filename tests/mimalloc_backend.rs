@@ -1,4 +1,8 @@
 #[cfg(feature = "backend-mimalloc")]
+#[path = "support/push_receiver.rs"]
+mod push_receiver;
+
+#[cfg(feature = "backend-mimalloc")]
 mod tests {
     use std::alloc::{alloc_zeroed, dealloc, realloc, Layout};
     use std::sync::{
@@ -17,6 +21,75 @@ mod tests {
     static ALLOC: SamplingMiMalloc = SamplingMiMalloc::new();
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn live_heap_report_preserves_source_metadata_through_http_upload() {
+        use pyroscope::{
+            pyroscope::PyroscopeConfig,
+            session::{Session, SessionManager, SessionSignal},
+        };
+        let _guard = TEST_LOCK.lock().expect("lock upload test");
+        let mut backend = live_backend();
+        let retained = allocate_retained_live_test(2 * 1024 * 1024);
+        let batch = backend.report().expect("collect live heap profile");
+        let ReportData::RawPprof(ref bytes) = batch.data else {
+            panic!("raw memory profile expected");
+        };
+        let expected_bytes = bytes.clone();
+        let expected = Profile::decode(bytes.as_slice()).unwrap();
+        let function = expected
+            .function
+            .iter()
+            .find(|function| {
+                expected.string_table[function.name as usize]
+                    .contains("allocate_retained_live_test")
+            })
+            .expect("retained allocation symbol");
+        assert!(expected.string_table[function.filename as usize].ends_with("mimalloc_backend.rs"));
+        assert!(expected.location.iter().any(|location| {
+            location.address != 0
+                && location
+                    .line
+                    .iter()
+                    .any(|line| line.function_id == function.id && line.line > 0)
+        }));
+        assert_eq!(
+            sample_value_for_frame(&expected, "allocate_retained_live_test", "inuse_space"),
+            retained.len() as i64
+        );
+        backend.shutdown().unwrap();
+
+        let receiver = super::push_receiver::PushReceiver::start();
+        let config = PyroscopeConfig::new(
+            &receiver.url,
+            "mimalloc-upload",
+            100,
+            "pyroscope-rs",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .tags(vec![("env", "integration")]);
+        let session = Session::new(1950, config, batch).unwrap();
+        let manager = SessionManager::new().unwrap();
+        manager
+            .push(SessionSignal::Session(Box::new(session)))
+            .unwrap();
+        manager.push(SessionSignal::Kill).unwrap();
+        manager.handle.unwrap().join().unwrap().unwrap();
+        let captured = receiver.finish();
+        assert_eq!(captured.path, "/push.v1.PusherService/Push");
+        assert_eq!(captured.headers["content-encoding"], "gzip");
+        let series = &captured.request.series[0];
+        assert!(series
+            .labels
+            .iter()
+            .any(|label| label.name == "__name__" && label.value == "memory"));
+        assert_eq!(series.samples[0].raw_profile, expected_bytes);
+        assert_eq!(
+            Profile::decode(series.samples[0].raw_profile.as_slice()).unwrap(),
+            expected
+        );
+        std::hint::black_box(&retained);
+    }
 
     #[test]
     fn mimalloc_backend_reports_raw_memory_pprof() {

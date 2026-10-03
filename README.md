@@ -80,6 +80,21 @@ stacks. Only one mimalloc backend may be active per process. Unresolved frames
 fall back to instruction addresses or a synthetic frame. Thread tags are
 no-ops, as in the jemalloc backend; agent-wide tags remain supported.
 
+Memory pprof locations retain instruction addresses and inline call chains.
+Function filenames and source lines are included when debug information is
+available. To retain source information in optimized builds:
+
+```toml
+[profile.release]
+debug = 1
+strip = "none"
+```
+
+This backend does not yet export executable mappings or build IDs for external
+symbolization. The upload path is covered by loopback HTTP integration tests
+for memory profiles, gzip payloads, authentication, tenant headers, and labels;
+these tests do not replace validation against a deployed Pyroscope server.
+
 Useful local checks:
 
 ```bash
