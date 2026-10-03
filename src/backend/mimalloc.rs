@@ -507,7 +507,7 @@ unsafe impl GlobalAlloc for SamplingMiMalloc {
         // Remove before freeing: another thread may immediately reuse this
         // address once mimalloc receives it.
         if live::enabled() {
-            with_profiler_suppressed(|| live::remove(ptr as usize));
+            remove_live_allocation(ptr as usize);
         }
         // SAFETY: Deallocation is forwarded unchanged; callers must pass a
         // pointer and layout that satisfy the `GlobalAlloc::dealloc` contract.
@@ -721,6 +721,13 @@ fn mark_allocator_seen() {
     if !ALLOCATOR_SEEN.load(Ordering::Relaxed) {
         ALLOCATOR_SEEN.store(true, Ordering::Relaxed);
     }
+}
+
+// Keep TLS suppression and table lookups out of the default allocator's
+// deallocation body, including their stack/register requirements.
+#[inline(never)]
+fn remove_live_allocation(pointer: usize) {
+    with_profiler_suppressed(|| live::remove(pointer));
 }
 
 fn with_profiler_suppressed<R>(f: impl FnOnce() -> R) -> R {
