@@ -7,6 +7,7 @@
 //!
 //! ```sh
 //! cargo run --example mimalloc --features backend-mimalloc
+//! MIMALLOC_LIVE_HEAP=1 cargo run --example mimalloc --features backend-mimalloc
 //! ```
 
 use pyroscope::backend::mimalloc::{mimalloc_backend, MimallocConfig, SamplingMiMalloc};
@@ -18,6 +19,7 @@ static ALLOC: SamplingMiMalloc = SamplingMiMalloc::new();
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
+    let live_heap = std::env::var("MIMALLOC_LIVE_HEAP").is_ok_and(|value| value == "1");
 
     let agent = PyroscopeAgentBuilder::new(
         "http://localhost:4040",
@@ -25,12 +27,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         100,
         "pyroscope-rs",
         env!("CARGO_PKG_VERSION"),
-        mimalloc_backend(MimallocConfig::default()),
+        mimalloc_backend(MimallocConfig {
+            live_heap_tracking: live_heap,
+            ..MimallocConfig::default()
+        }),
     )
     .tags(vec![("env", "dev")])
     .build()?;
 
     let agent_running = agent.start()?;
+    let retained: Vec<Vec<u8>> = if live_heap {
+        (0..64).map(|_| vec![0; 128 * 1024]).collect()
+    } else {
+        Vec::new()
+    };
 
     let start = std::time::Instant::now();
     let mut iteration = 0u64;
@@ -41,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::hint::black_box(&allocation);
         }
         iteration += 1;
+        std::hint::black_box(&retained);
     }
     eprintln!("Completed {iteration} iterations");
 

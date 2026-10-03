@@ -45,17 +45,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The mimalloc backend records allocation samples and emits memory pprof data
-through the normal Pyroscope upload path. It is an allocation profile, not a
-live heap/in-use profile, and it requires `SamplingMiMalloc`; using
-`rustfs_mimalloc::MiMalloc` directly will not capture allocation call stacks. Samples
-with unresolved frames may be grouped under a synthetic fallback frame.
+The default mimalloc backend records allocation events (`alloc_objects` and
+`alloc_space`) through the normal Pyroscope upload path. Enable live heap
+profiling to also report `inuse_objects` and `inuse_space`, with `inuse_space`
+selected by default, matching the jemalloc backend's live memory view:
+
+```rust
+let backend = mimalloc_backend(MimallocConfig {
+    live_heap_tracking: true,
+    max_live_samples: 16_384,
+    ..MimallocConfig::default()
+});
+```
+
+Live tracking covers Rust allocations made through `SamplingMiMalloc` after
+initialization, including cross-thread frees and reallocations. It reports
+sampling-weighted requested sizes, not allocator usable sizes or allocations
+made directly by native libraries. Its metadata is bounded and preallocated;
+full or contended shards omit new live samples, exposed by
+`mimalloc_stats().dropped_live_samples`. Freeing a tracked pointer reliably
+removes it, which may briefly wait for its shard lock. Reports copy shards one
+at a time, so concurrent heap snapshots are approximate rather than atomic.
+
+The feature uses `rustfs-mimalloc` and requires Rust 1.96 or newer. Applications
+must install `SamplingMiMalloc`; initialization fails when it has not observed
+allocations. Using `rustfs_mimalloc::MiMalloc` directly does not capture call
+stacks. Only one mimalloc backend may be active per process. Unresolved frames
+fall back to instruction addresses or a synthetic frame. Thread tags are
+no-ops, as in the jemalloc backend; agent-wide tags remain supported.
 
 Useful local checks:
 
 ```bash
 cargo run --example mimalloc --features backend-mimalloc
 cargo run --release --example mimalloc_overhead --features backend-mimalloc
+MIMALLOC_BENCH_MODE=live cargo run --release --example mimalloc_overhead --features backend-mimalloc
 make mimalloc/bench/report
 cargo test --locked --test mimalloc_backend --features backend-mimalloc -- --ignored
 ```
@@ -65,7 +89,12 @@ outputs under `target/mimalloc-benchmark/`. The GitHub Actions
 `mimalloc benchmark report` job uploads the same directory as the
 `mimalloc-benchmark-report` artifact, including throughput, overhead,
 recorder counters, report latency, encoded pprof size, pprof encode time, and
-sampled allocation latency percentiles.
+sampled allocation latency percentiles. Live heap scenarios at 1 MiB, 512 KiB,
+and 4 KiB sampling intervals also retain a working set through report creation.
+Their raw outputs include live sample counts, dropped live samples, and
+preallocated metadata payload bytes (excluding hash control bytes, shard
+headers, and allocator bookkeeping). Benchmark warnings are diagnostic;
+performance claims require repeat runs on an otherwise idle machine.
 
 ### Major Contributors
 

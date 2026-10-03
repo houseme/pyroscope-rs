@@ -1,5 +1,6 @@
 #[cfg(feature = "backend-mimalloc")]
 mod tests {
+    use std::alloc::{alloc_zeroed, dealloc, realloc, Layout};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Barrier, Mutex,
@@ -132,6 +133,270 @@ mod tests {
     }
 
     #[test]
+    fn live_heap_profiles_retained_and_freed_allocations_across_reports() {
+        let _guard = TEST_LOCK.lock().expect("lock live heap test");
+        let mut backend = live_backend();
+        let retained = allocate_retained_live_test(2 * 1024 * 1024);
+        std::hint::black_box(&retained);
+
+        let first = report_profile(&mut backend);
+        assert_eq!(
+            first.string_table[first.default_sample_type as usize],
+            "inuse_space"
+        );
+        assert_eq!(
+            sample_value_for_frame(&first, "allocate_retained_live_test", "inuse_space"),
+            retained.len() as i64
+        );
+        assert!(sample_value_for_frame(&first, "allocate_retained_live_test", "alloc_space") > 0);
+        let second = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&second, "allocate_retained_live_test", "inuse_space"),
+            retained.len() as i64
+        );
+        assert_eq!(
+            sample_value_for_frame(&second, "allocate_retained_live_test", "alloc_space"),
+            0
+        );
+
+        drop(retained);
+        let freed = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&freed, "allocate_retained_live_test", "inuse_space"),
+            0
+        );
+        backend.shutdown().expect("shutdown live heap backend");
+        assert_eq!(mimalloc_stats().live_samples, 0);
+    }
+
+    #[test]
+    fn live_heap_tracks_zeroed_allocation_after_thread_exit_and_cross_thread_free() {
+        let _guard = TEST_LOCK.lock().expect("lock cross-thread live test");
+        let mut backend = live_backend();
+        let size = 2 * 1024 * 1024;
+        let pointer = std::thread::spawn(move || allocate_zeroed_live_test(size))
+            .join()
+            .expect("join allocating thread");
+        let held = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&held, "allocate_zeroed_live_test", "inuse_space"),
+            size as i64
+        );
+
+        std::thread::spawn(move || {
+            // SAFETY: The allocating thread transferred ownership of this
+            // pointer, and the layout matches its alloc_zeroed request.
+            unsafe {
+                dealloc(
+                    pointer as *mut u8,
+                    Layout::from_size_align(size, 8).unwrap(),
+                )
+            };
+        })
+        .join()
+        .expect("join freeing thread");
+        let freed = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&freed, "allocate_zeroed_live_test", "inuse_space"),
+            0
+        );
+        backend.shutdown().expect("shutdown live heap backend");
+    }
+
+    #[test]
+    fn live_heap_resamples_successful_reallocation_and_preserves_failed_reallocation() {
+        let _guard = TEST_LOCK.lock().expect("lock realloc live test");
+        let mut backend = live_backend();
+        let old_size = 2 * 1024 * 1024;
+        let pointer = allocate_zeroed_live_test(old_size);
+        let old_layout = Layout::from_size_align(old_size, 8).unwrap();
+        let new_size = 4 * 1024 * 1024;
+        // SAFETY: pointer is live and its layout matches the original request.
+        let new_pointer = unsafe { resize_live_test(pointer as *mut u8, old_layout, new_size) };
+        assert!(!new_pointer.is_null());
+        let grown = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&grown, "allocate_zeroed_live_test", "inuse_space"),
+            0
+        );
+        assert_eq!(
+            sample_value_for_frame(&grown, "resize_live_test", "inuse_space"),
+            new_size as i64
+        );
+
+        let new_layout = Layout::from_size_align(new_size, 8).unwrap();
+        // SAFETY: The replacement is live with the layout supplied above.
+        let same_pointer = unsafe { resize_live_test(new_pointer, new_layout, new_size) };
+        assert_eq!(
+            same_pointer, new_pointer,
+            "same-size mimalloc realloc should retain its address"
+        );
+        let in_place = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&in_place, "resize_live_test", "inuse_space"),
+            new_size as i64
+        );
+        // SAFETY: This valid but unfulfillable request exercises the allocator's
+        // null-return path without invoking Rust's handle_alloc_error.
+        let failed = unsafe { realloc(new_pointer, new_layout, isize::MAX as usize / 2) };
+        assert!(
+            failed.is_null(),
+            "expected address-space-sized realloc to fail"
+        );
+        let after_failure = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&after_failure, "resize_live_test", "inuse_space"),
+            new_size as i64
+        );
+        let shrunk_size = 1024 * 1024;
+        // SAFETY: Failed realloc preserves new_pointer and its original layout.
+        let shrunk_pointer = unsafe { resize_live_test(new_pointer, new_layout, shrunk_size) };
+        assert!(!shrunk_pointer.is_null());
+        let shrunk = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&shrunk, "resize_live_test", "inuse_space"),
+            shrunk_size as i64
+        );
+        // SAFETY: Successful realloc transfers ownership to shrunk_pointer.
+        unsafe {
+            dealloc(
+                shrunk_pointer,
+                Layout::from_size_align(shrunk_size, 8).unwrap(),
+            )
+        };
+        let freed = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&freed, "resize_live_test", "inuse_space"),
+            0
+        );
+        backend.shutdown().expect("shutdown live heap backend");
+    }
+
+    #[test]
+    fn live_heap_restart_excludes_objects_from_the_previous_session() {
+        let _guard = TEST_LOCK.lock().expect("lock restart live heap test");
+        let mut first = live_backend();
+        let retained = allocate_retained_live_test(2 * 1024 * 1024);
+        assert!(
+            sample_value_for_frame(
+                &report_profile(&mut first),
+                "allocate_retained_live_test",
+                "inuse_space"
+            ) > 0
+        );
+        first.shutdown().expect("shutdown first live session");
+        let mut second = live_backend();
+        assert_eq!(
+            sample_value_for_frame(
+                &report_profile(&mut second),
+                "allocate_retained_live_test",
+                "inuse_space"
+            ),
+            0
+        );
+        drop(retained);
+        second.shutdown().expect("shutdown restarted live session");
+    }
+
+    #[test]
+    fn live_heap_stays_correct_during_concurrent_reports_and_cross_thread_frees() {
+        let _guard = TEST_LOCK.lock().expect("lock concurrent live heap test");
+        let mut backend = live_backend();
+        let size = 2 * 1024 * 1024;
+        let pointers: Vec<_> = (0..16).map(|_| allocate_zeroed_live_test(size)).collect();
+        let start = Arc::new(Barrier::new(2));
+        let worker_start = Arc::clone(&start);
+        let worker = std::thread::spawn(move || {
+            worker_start.wait();
+            for pointer in pointers {
+                // SAFETY: Each pointer is owned by this worker and was
+                // allocated with the matching size/alignment.
+                unsafe {
+                    dealloc(
+                        pointer as *mut u8,
+                        Layout::from_size_align(size, 8).unwrap(),
+                    )
+                };
+            }
+        });
+        start.wait();
+        for _ in 0..4 {
+            let _ = report_profile(&mut backend);
+        }
+        worker.join().expect("join concurrent freeing thread");
+        let final_profile = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&final_profile, "allocate_zeroed_live_test", "inuse_space"),
+            0
+        );
+        backend.shutdown().expect("shutdown live heap backend");
+    }
+
+    fn live_backend() -> pyroscope::backend::BackendImpl<pyroscope::backend::BackendReady> {
+        mimalloc_backend(MimallocConfig {
+            sample_interval_bytes: 4096,
+            live_heap_tracking: true,
+            max_live_samples: 4096,
+            ring_capacity: 4096,
+            ..MimallocConfig::default()
+        })
+        .initialize()
+        .expect("initialize live heap backend")
+    }
+
+    #[inline(never)]
+    fn allocate_retained_live_test(size: usize) -> Vec<u8> {
+        std::hint::black_box(vec![0; size])
+    }
+
+    #[inline(never)]
+    fn allocate_zeroed_live_test(size: usize) -> usize {
+        // SAFETY: size is nonzero and the layout has valid alignment.
+        let pointer = unsafe { alloc_zeroed(Layout::from_size_align(size, 8).unwrap()) };
+        assert!(!pointer.is_null());
+        std::hint::black_box(pointer as usize)
+    }
+
+    #[inline(never)]
+    unsafe fn resize_live_test(pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        // SAFETY: The caller supplies a live allocation and its matching layout.
+        let pointer = unsafe { realloc(pointer, layout, size) };
+        std::hint::black_box(pointer)
+    }
+
+    fn sample_value_for_frame(profile: &Profile, frame: &str, sample_type: &str) -> i64 {
+        let value_index = profile
+            .sample_type
+            .iter()
+            .position(|ty| profile.string_table[ty.r#type as usize] == sample_type)
+            .expect("profile includes requested sample type");
+        profile
+            .sample
+            .iter()
+            .filter(|sample| {
+                sample.location_id.iter().any(|id| {
+                    profile
+                        .location
+                        .iter()
+                        .filter(|location| location.id == *id)
+                        .any(|location| {
+                            location.line.iter().any(|line| {
+                                profile
+                                    .function
+                                    .iter()
+                                    .filter(|function| function.id == line.function_id)
+                                    .any(|function| {
+                                        profile.string_table[function.name as usize].contains(frame)
+                                    })
+                            })
+                        })
+                })
+            })
+            .map(|sample| sample.value[value_index])
+            .sum()
+    }
+
+    #[test]
     #[ignore = "stress test for release validation; run with --ignored when validating mimalloc pressure"]
     fn mimalloc_backend_stress_tests_thread_matrix_and_drop_pressure() {
         let _guard = TEST_LOCK.lock().expect("lock mimalloc backend stress test");
@@ -153,6 +418,24 @@ mod tests {
             drop_pressure_stats.dropped_samples > 0,
             "expected dropped samples under constrained recorder capacity, got {drop_pressure_stats:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "live heap release validation across allocation/free thread pressure"]
+    fn live_heap_stress_thread_matrix_leaves_no_stale_worker_allocations() {
+        let _guard = TEST_LOCK.lock().expect("lock live heap stress test");
+        for worker_count in [1, 2, 4, 8, 16, 32] {
+            let mut backend = live_backend();
+            run_allocation_workers(worker_count, 64, 64);
+            let profile = report_profile(&mut backend);
+            assert_eq!(
+                sample_value_for_frame(&profile, "run_allocation_workers", "inuse_space"),
+                0
+            );
+            assert!(mimalloc_stats().live_samples <= 4096);
+            backend.shutdown().expect("shutdown live stress backend");
+            assert_eq!(mimalloc_stats().live_samples, 0);
+        }
     }
 
     fn report_profile(

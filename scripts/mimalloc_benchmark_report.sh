@@ -31,6 +31,9 @@ history_timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 history_run_id="${GITHUB_RUN_ID:-local}"
 history_run_attempt="${GITHUB_RUN_ATTEMPT:-1}"
 history_commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if ! git diff --quiet --ignore-submodules -- || ! git diff --cached --quiet --ignore-submodules --; then
+    history_commit="${history_commit}-dirty"
+fi
 
 ensure_history_header() {
     if [ -f "$history_path" ]; then
@@ -73,15 +76,17 @@ run_baseline() {
 }
 
 run_inactive() {
-    cargo run --locked --release --quiet --example mimalloc_overhead --features backend-mimalloc \
+    MIMALLOC_BENCH_MODE=inactive \
+        cargo run --locked --release --quiet --example mimalloc_overhead --features backend-mimalloc \
         > "${output_dir}/inactive.env"
 }
 
 run_active() {
     local name="$1"
     local interval_bytes="$2"
+    local mode="${3:-active}"
 
-    MIMALLOC_BENCH_MODE=active \
+    MIMALLOC_BENCH_MODE="$mode" \
     MIMALLOC_BENCH_SAMPLE_INTERVAL="$interval_bytes" \
         cargo run --locked --release --quiet --example mimalloc_overhead --features backend-mimalloc \
         > "${output_dir}/${name}.env"
@@ -179,6 +184,9 @@ run_inactive
 run_active active-1m 1048576
 run_active active-512k 524288
 run_active active-4k 4096
+run_active live-1m 1048576 live
+run_active live-512k 524288 live
+run_active live-4k 4096 live
 
 failures=0
 baseline_mib_per_sec="$(metric "${output_dir}/baseline.env" mib_per_sec)"
@@ -217,6 +225,9 @@ append_row "inactive" "${output_dir}/inactive.env" "$baseline_mib_per_sec" "$MIM
 append_row "active-1m" "${output_dir}/active-1m.env" "$baseline_mib_per_sec" "$MIMALLOC_BENCH_ACTIVE_1M_MAX_OVERHEAD_PCT" "PASS"
 append_row "active-512k" "${output_dir}/active-512k.env" "$baseline_mib_per_sec" "" "INFO"
 append_row "active-4k" "${output_dir}/active-4k.env" "$baseline_mib_per_sec" "" "DIAGNOSTIC"
+append_row "live-1m" "${output_dir}/live-1m.env" "$baseline_mib_per_sec" "" "DIAGNOSTIC"
+append_row "live-512k" "${output_dir}/live-512k.env" "$baseline_mib_per_sec" "" "DIAGNOSTIC"
+append_row "live-4k" "${output_dir}/live-4k.env" "$baseline_mib_per_sec" "" "DIAGNOSTIC"
 
 {
     echo
@@ -229,7 +240,13 @@ append_row "active-4k" "${output_dir}/active-4k.env" "$baseline_mib_per_sec" "" 
     echo "- active-1m.env"
     echo "- active-512k.env"
     echo "- active-4k.env"
+    echo "- live-1m.env"
+    echo "- live-512k.env"
+    echo "- live-4k.env"
     echo "- history/mimalloc-benchmark-history.csv"
+    echo
+    echo "Live heap raw outputs include live_samples, dropped_live_samples, and live_metadata_payload_bytes."
+    echo "Payload bytes exclude hash control bytes, shard headers, and allocator bookkeeping."
 } >> "$report_path"
 
 cat "$report_path"

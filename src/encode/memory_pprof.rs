@@ -13,6 +13,8 @@ pub struct AllocationSample {
     pub frames: Vec<String>,
     pub alloc_objects: i64,
     pub alloc_space: i64,
+    pub inuse_objects: i64,
+    pub inuse_space: i64,
 }
 
 impl AllocationSample {
@@ -21,6 +23,8 @@ impl AllocationSample {
             frames,
             alloc_objects,
             alloc_space,
+            inuse_objects: 0,
+            inuse_space: 0,
         }
     }
 }
@@ -28,12 +32,12 @@ impl AllocationSample {
 struct PprofMemoryBuilder {
     profile: Profile,
     strings: HashMap<String, i64>,
-    functions: HashMap<String, u64>,
     locations: HashMap<String, u64>,
+    live_heap: bool,
 }
 
 impl PprofMemoryBuilder {
-    fn new(period: i64, duration_nanos: i64) -> Self {
+    fn new(period: i64, duration_nanos: i64, live_heap: bool) -> Self {
         let mut builder = Self {
             profile: Profile {
                 sample_type: vec![],
@@ -52,8 +56,8 @@ impl PprofMemoryBuilder {
                 default_sample_type: 0,
             },
             strings: HashMap::new(),
-            functions: HashMap::new(),
             locations: HashMap::new(),
+            live_heap,
         };
 
         builder.add_string("");
@@ -76,6 +80,21 @@ impl PprofMemoryBuilder {
             unit: bytes,
         });
         builder.profile.default_sample_type = alloc_space;
+        if live_heap {
+            let inuse_objects = builder.add_string("inuse_objects");
+            let inuse_space = builder.add_string("inuse_space");
+            builder.profile.sample_type.extend([
+                ValueType {
+                    r#type: inuse_objects,
+                    unit: count,
+                },
+                ValueType {
+                    r#type: inuse_space,
+                    unit: bytes,
+                },
+            ]);
+            builder.profile.default_sample_type = inuse_space;
+        }
 
         builder
     }
@@ -97,20 +116,17 @@ impl PprofMemoryBuilder {
         }
 
         let name_id = self.add_string(name);
-        let function_id = if let Some(function_id) = self.functions.get(name) {
-            *function_id
-        } else {
-            let function_id = self.profile.function.len() as u64 + 1;
-            self.profile.function.push(Function {
-                id: function_id,
-                name: name_id,
-                system_name: 0,
-                filename: 0,
-                start_line: 0,
-            });
-            self.functions.insert(name.to_owned(), function_id);
-            function_id
-        };
+        // Each unique frame name has one location and one function. The
+        // location lookup above already handles reuse; a second map duplicates
+        // its keys and lookups without distinguishing additional functions.
+        let function_id = self.profile.function.len() as u64 + 1;
+        self.profile.function.push(Function {
+            id: function_id,
+            name: name_id,
+            system_name: 0,
+            filename: 0,
+            start_line: 0,
+        });
 
         let location_id = self.profile.location.len() as u64 + 1;
         self.profile.location.push(Location {
@@ -128,7 +144,7 @@ impl PprofMemoryBuilder {
     }
 
     fn add_sample(&mut self, sample: &AllocationSample) {
-        if sample.alloc_objects <= 0 || sample.alloc_space <= 0 {
+        if sample.alloc_space <= 0 && (!self.live_heap || sample.inuse_space <= 0) {
             return;
         }
 
@@ -138,9 +154,13 @@ impl PprofMemoryBuilder {
             .map(|frame| self.add_frame(frame))
             .collect();
 
+        let mut value = vec![sample.alloc_objects, sample.alloc_space];
+        if self.live_heap {
+            value.extend([sample.inuse_objects, sample.inuse_space]);
+        }
         self.profile.sample.push(Sample {
             location_id,
-            value: vec![sample.alloc_objects, sample.alloc_space],
+            value,
             label: vec![],
         });
     }
@@ -151,8 +171,18 @@ pub fn encode_allocation_profile(
     period: u64,
     duration_nanos: i64,
 ) -> Vec<u8> {
+    encode_memory_profile(samples, period, duration_nanos, false)
+}
+
+/// Encode interval allocation counters and, when enabled, a live heap snapshot.
+pub fn encode_memory_profile(
+    samples: &[AllocationSample],
+    period: u64,
+    duration_nanos: i64,
+    live_heap: bool,
+) -> Vec<u8> {
     let period = i64::try_from(period).unwrap_or(i64::MAX);
-    let mut builder = PprofMemoryBuilder::new(period, duration_nanos);
+    let mut builder = PprofMemoryBuilder::new(period, duration_nanos, live_heap);
 
     for sample in samples {
         builder.add_sample(sample);
@@ -207,5 +237,40 @@ mod tests {
         assert_eq!(profile.sample.len(), 0);
         assert_eq!(profile.sample_type.len(), 2);
         assert_eq!(profile.period, 1024 * 1024);
+    }
+
+    #[test]
+    fn live_heap_profile_keeps_live_only_samples_and_selects_inuse_space() {
+        let mut sample = AllocationSample::new(vec!["retained".into()], 0, 0);
+        sample.inuse_objects = 3;
+        sample.inuse_space = 8192;
+        let bytes = encode_memory_profile(&[sample], 4096, 42, true);
+        let profile = Profile::decode(bytes.as_slice()).expect("decode live heap pprof");
+        let types: Vec<_> = profile
+            .sample_type
+            .iter()
+            .map(|ty| {
+                (
+                    profile.string_table[ty.r#type as usize].as_str(),
+                    profile.string_table[ty.unit as usize].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            types,
+            [
+                ("alloc_objects", "count"),
+                ("alloc_space", "bytes"),
+                ("inuse_objects", "count"),
+                ("inuse_space", "bytes")
+            ]
+        );
+        assert_eq!(
+            profile.string_table[profile.default_sample_type as usize],
+            "inuse_space"
+        );
+        assert_eq!(profile.sample[0].value, [0, 0, 3, 8192]);
+        assert_eq!(profile.period, 4096);
+        assert_eq!(profile.duration_nanos, 42);
     }
 }
