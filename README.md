@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 The mimalloc backend records allocation samples and emits memory pprof data
 through the normal Pyroscope upload path. It is an allocation profile, not a
 live heap/in-use profile, and it requires `SamplingMiMalloc`; using
-`mimalloc::MiMalloc` directly will not capture allocation call stacks. Samples
+`rustfs_mimalloc::MiMalloc` directly will not capture allocation call stacks. Samples
 with unresolved frames may be grouped under a synthetic fallback frame.
 
 Useful local checks:

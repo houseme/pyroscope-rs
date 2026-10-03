@@ -120,7 +120,7 @@ fn should_sample_latency(
 ) -> bool {
     config.latency_sample_interval > 0
         && config.latency_sample_limit > collected_samples
-        && allocation_index % config.latency_sample_interval == 0
+        && allocation_index.is_multiple_of(config.latency_sample_interval)
 }
 
 fn calculate_latency_percentiles(mut samples: Vec<u128>) -> Option<LatencyPercentiles> {

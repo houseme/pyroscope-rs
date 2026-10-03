@@ -10,7 +10,7 @@ mod support;
 use support::{print_workload, run_workload, WorkloadConfig};
 
 #[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static ALLOC: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
 fn main() {
     let config = WorkloadConfig::from_env();

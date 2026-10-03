@@ -18,6 +18,7 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
+use rustfs_mimalloc as mimalloc;
 
 use crate::{
     backend::{Backend, BackendImpl, BackendUninitialized, ReportBatch, ReportData, ThreadTag},
@@ -229,8 +230,10 @@ impl Drop for RegisteredTlsSampleBuffer {
     fn drop(&mut self) {
         with_profiler_suppressed(|| {
             if RECORDER_ACTIVE.load(Ordering::Acquire) {
-                if let Some(mut buffer) = self.try_lock() {
-                    flush_tls_samples_for_report(&mut buffer);
+                if let Ok(mut buffer) = self.buffer.lock() {
+                    if !flush_tls_samples_for_report(&mut buffer) {
+                        drop_tls_samples(&mut buffer);
+                    }
                 }
             }
             // Deregister only after the final handoff attempt so a concurrent
@@ -378,7 +381,7 @@ impl MimallocConfig {
 /// ```
 ///
 /// The backend cannot record allocation call stacks when an application uses
-/// `mimalloc::MiMalloc` directly.
+/// `rustfs_mimalloc::MiMalloc` directly.
 pub struct SamplingMiMalloc {
     inner: mimalloc::MiMalloc,
 }
@@ -549,8 +552,13 @@ impl Backend for Mimalloc {
                 .unwrap_or_default();
 
             request_tls_sample_flush();
-            flush_registered_tls_samples();
-            let recorded = drain_recorded_samples(self.config.report_drain_limit);
+            let mut recorded = Vec::new();
+            let tls_drained = drain_registered_tls_samples_for_report(
+                &mut recorded,
+                self.config.report_drain_limit,
+            );
+            let remaining_drain_limit = self.config.report_drain_limit.saturating_sub(tls_drained);
+            recorded.extend(drain_recorded_samples(remaining_drain_limit));
             let recorded_count = recorded.len();
             let dropped_count = DROPPED_SAMPLES.load(Ordering::Relaxed);
             if dropped_count > 0 {
@@ -969,6 +977,7 @@ fn count_recorded_samples() -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn flush_registered_tls_samples() {
     // `report()` is outside the allocation hot path, so it can block briefly to
     // make the profile interval deterministic instead of best-effort.
@@ -979,6 +988,27 @@ fn flush_registered_tls_samples() {
     }
 }
 
+fn drain_registered_tls_samples_for_report(
+    out: &mut Vec<RecordedAllocationSample>,
+    limit: usize,
+) -> usize {
+    let mut drained = 0;
+    for buffer in registered_tls_sample_buffers() {
+        if drained == limit {
+            break;
+        }
+        if let Ok(mut buffer) = buffer.lock() {
+            let moved = buffer.drain_into(out, limit - drained);
+            if moved > 0 {
+                FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
+                FLUSHED_SAMPLE_COUNT.fetch_add(moved as u64, Ordering::Relaxed);
+                drained += moved;
+            }
+        }
+    }
+    drained
+}
+
 fn clear_registered_tls_samples() {
     // Used only at backend lifecycle boundaries; clear rather than flush so
     // stale samples from a previous session cannot leak into a new report.
@@ -986,6 +1016,14 @@ fn clear_registered_tls_samples() {
         if let Ok(mut buffer) = buffer.lock() {
             buffer.clear();
         }
+    }
+}
+
+fn drop_tls_samples(buffer: &mut TlsSampleBuffer) {
+    let dropped = buffer.len();
+    if dropped > 0 {
+        DROPPED_SAMPLES.fetch_add(dropped as u64, Ordering::Relaxed);
+        buffer.clear();
     }
 }
 
@@ -1723,6 +1761,50 @@ mod tests {
     }
 
     #[test]
+    fn report_tls_drain_bypasses_full_global_buffer() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        let global_stack = StackKey {
+            frames: [1; MAX_CAPTURE_DEPTH],
+            depth: 1,
+        };
+        let tls_stack = StackKey {
+            frames: [2; MAX_CAPTURE_DEPTH],
+            depth: 1,
+        };
+        clear_test_buffers();
+        MAX_RECORDED_SAMPLES.store(1, Ordering::Relaxed);
+        FLUSH_COUNT.store(0, Ordering::Relaxed);
+        FLUSHED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+        push_global_test_samples([test_sample(global_stack)]);
+
+        let tls_buffer = Arc::new(Mutex::new(TlsSampleBuffer::new()));
+        {
+            let mut buffer = tls_buffer.lock().expect("lock tls buffer");
+            assert!(buffer.push(test_sample(tls_stack)));
+            assert!(buffer.push(test_sample(tls_stack)));
+        }
+        let id = register_tls_sample_buffer(tls_buffer.clone()).expect("register tls buffer");
+        let mut recorded = Vec::new();
+
+        let drained = drain_registered_tls_samples_for_report(&mut recorded, 10);
+
+        assert_eq!(drained, 2);
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().all(|sample| sample.stack == tls_stack));
+        assert_eq!(tls_buffer.lock().expect("lock tls buffer").len(), 0);
+        assert_eq!(count_recorded_samples(), 1);
+        assert_eq!(GLOBAL_BUFFERED_SAMPLE_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(mimalloc_stats().flushes, 1);
+        assert_eq!(mimalloc_stats().flushed_samples, 2);
+
+        deregister_tls_sample_buffer(id);
+        clear_test_buffers();
+        FLUSH_COUNT.store(0, Ordering::Relaxed);
+        FLUSHED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+        MAX_RECORDED_SAMPLES.store(DEFAULT_RING_CAPACITY, Ordering::Relaxed);
+    }
+
+    #[test]
     fn tls_sample_buffer_flushes_on_thread_exit_when_recorder_is_active() {
         let _guard = TEST_LOCK.lock().expect("lock test");
         let stack = StackKey {
@@ -1752,6 +1834,45 @@ mod tests {
         assert!(stats.flushes >= 1);
         assert!(stats.flushed_samples >= 2);
         assert_eq!(stats.dropped_samples, 0);
+        assert_eq!(registered_tls_buffered_samples(), Some(0));
+
+        clear_test_buffers();
+        FLUSH_COUNT.store(0, Ordering::Relaxed);
+        FLUSHED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+        DROPPED_SAMPLES.store(0, Ordering::Relaxed);
+        MAX_RECORDED_SAMPLES.store(DEFAULT_RING_CAPACITY, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn tls_sample_buffer_counts_drop_when_thread_exit_flush_has_no_global_capacity() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        let stack = StackKey {
+            frames: [42; MAX_CAPTURE_DEPTH],
+            depth: 1,
+        };
+        clear_test_buffers();
+        MAX_RECORDED_SAMPLES.store(0, Ordering::Relaxed);
+        FLUSH_COUNT.store(0, Ordering::Relaxed);
+        FLUSHED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+        DROPPED_SAMPLES.store(0, Ordering::Relaxed);
+        RECORDER_ACTIVE.store(true, Ordering::Release);
+        let _active_guard = RecorderActiveGuard;
+
+        std::thread::spawn(move || {
+            TLS_SAMPLE_BUFFER.with(|buffer| {
+                let mut buffer = buffer.try_lock().expect("lock worker buffer");
+                assert!(buffer.push(test_sample(stack)));
+                assert!(buffer.push(test_sample(stack)));
+            });
+        })
+        .join()
+        .expect("join allocation thread");
+
+        let stats = mimalloc_stats();
+        assert_eq!(stats.dropped_samples, 2);
+        assert_eq!(stats.flushes, 0);
+        assert_eq!(stats.flushed_samples, 0);
+        assert_eq!(stats.buffered_samples, Some(0));
         assert_eq!(registered_tls_buffered_samples(), Some(0));
 
         clear_test_buffers();
