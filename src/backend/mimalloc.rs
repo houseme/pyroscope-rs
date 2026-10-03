@@ -341,6 +341,9 @@ pub struct MimallocConfig {
     /// successful reallocation. Removals may briefly wait for a shard lock so
     /// cross-thread frees never leave stale live entries. Only Rust allocations
     /// made through `SamplingMiMalloc` after initialization are tracked.
+    /// Same-address realloc preserves the original allocation stack and object
+    /// weight while updating size. Moving realloc samples the replacement
+    /// independently, without depending on the allocation-event byte remainder.
     pub live_heap_tracking: bool,
     /// Maximum number of sampled live pointers retained across all shards.
     ///
@@ -504,7 +507,7 @@ unsafe impl GlobalAlloc for SamplingMiMalloc {
         // Remove before freeing: another thread may immediately reuse this
         // address once mimalloc receives it.
         if live::enabled() {
-            with_recording_guard(|_| live::remove(ptr as usize));
+            with_profiler_suppressed(|| live::remove(ptr as usize));
         }
         // SAFETY: Deallocation is forwarded unchanged; callers must pass a
         // pointer and layout that satisfy the `GlobalAlloc::dealloc` contract.
@@ -513,28 +516,27 @@ unsafe impl GlobalAlloc for SamplingMiMalloc {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         mark_allocator_seen();
-        // Detach before mimalloc can recycle the old address. Reserve the old
-        // metadata slot until the result is known so failure can restore it.
+        // Keep the metadata slot reserved before mimalloc can recycle the old
+        // address. Lifecycle maintenance must also run while sampling is suppressed.
         let pending = if live::enabled() {
-            with_recording_guard(|_| live::detach(ptr as usize)).flatten()
+            with_profiler_suppressed(|| live::begin_reallocation(ptr as usize))
         } else {
             None
         };
         // SAFETY: Reallocation is forwarded unchanged to mimalloc with the
         // caller-provided pointer, old layout, and requested new size.
         let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
-        if let Some(pending) = pending {
-            with_recording_guard(|_| pending.finish(new_ptr.is_null()));
-        }
+        let previous = pending.and_then(|pending| {
+            with_profiler_suppressed(|| pending.finish(new_ptr as usize, new_size as u64))
+        });
         if !new_ptr.is_null() {
-            let recorded_size = if live::enabled() {
-                // Live profiling resamples the entire replacement allocation,
-                // including in-place shrink/growth, using its new requested size.
-                new_size
-            } else {
-                realloc_recorded_size(ptr, new_ptr, layout.size(), new_size)
-            };
-            record_allocation(new_ptr, recorded_size as u64);
+            if new_ptr != ptr && live::enabled() {
+                record_live_reallocation(new_ptr as usize, new_size as u64, previous);
+            }
+            let recorded_size = realloc_recorded_size(ptr, new_ptr, layout.size(), new_size);
+            // Live lifecycle updates and replacement sampling are independent
+            // of the event sampler, which charges only newly allocated bytes.
+            record_allocation(std::ptr::null_mut(), recorded_size as u64);
         }
         new_ptr
     }
@@ -942,6 +944,37 @@ fn calculate_deterministic_sample_weight(size: u64, current: u64, interval: u64)
 fn session_is_current(generation: u64) -> bool {
     RECORDER_ACTIVE.load(Ordering::Acquire)
         && SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire) == generation
+}
+
+fn record_live_reallocation(
+    pointer: usize,
+    size: u64,
+    previous: Option<(live::LiveAllocationSample, u64)>,
+) {
+    if !RECORDER_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    let generation = SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire);
+    let sampled = with_recording_guard(|sampler| {
+        let mut state = sampler.get();
+        if state.rng_state == 0 {
+            state.rng_state = next_thread_rng_seed();
+        }
+        let interval = SAMPLE_INTERVAL_BYTES.load(Ordering::Relaxed).max(1);
+        let hit = next_poisson_interval(interval, &mut state.rng_state) <= size;
+        sampler.set(state);
+        if hit {
+            let stack = StackKey::capture(CAPTURE_DEPTH.load(Ordering::Relaxed));
+            live::record(pointer, stack, size, interval, generation);
+        }
+    });
+    if sampled.is_none() {
+        // Suppression prevents capturing new profiler allocations, but never
+        // abandons the lifecycle of a pointer that was already tracked.
+        if let Some((sample, generation)) = previous {
+            with_profiler_suppressed(|| live::transfer_sample(pointer, sample, generation));
+        }
+    }
 }
 
 fn record_sample(ptr: *mut u8, size: u64, weight: SampleWeight, generation: u64) {
@@ -1700,16 +1733,17 @@ mod tests {
             .find(|other| splitmix64(*other as u64) % 64 == splitmix64(pointer as u64) % 64)
             .expect("colliding pointer");
         live::record(pointer, stack, 1024, 1, generation);
-        let pending = live::detach(pointer).expect("detach sampled pointer");
+        let pending = live::begin_reallocation(pointer).expect("reserve sampled pointer");
         live::record(collision, stack, 2048, 1, generation);
         assert_eq!(live::dropped_sample_count(), 1);
-        pending.finish(true);
+        pending.finish(0, 0);
         assert_eq!(live::sample_count(), 1);
         assert_eq!(live::snapshot()[0].weighted_bytes, 1024.0);
-        live::detach(pointer)
-            .expect("detach restored pointer")
-            .finish(false);
-        live::record(collision, stack, 2048, 1, generation);
+        let (sample, generation) = live::begin_reallocation(pointer)
+            .expect("reserve restored pointer")
+            .finish(collision, 2048)
+            .expect("moved sample");
+        live::transfer_sample(collision, sample, generation);
         assert_eq!(live::snapshot()[0].weighted_bytes, 2048.0);
     }
 
@@ -1725,13 +1759,13 @@ mod tests {
             depth: 1,
         };
         live::record(100, stack, 1024, 1, old_generation);
-        let pending = live::detach(100).expect("detach old-session pointer");
+        let pending = live::begin_reallocation(100).expect("reserve old-session pointer");
         RECORDER_ACTIVE.store(false, Ordering::Release);
         live::clear();
         let generation = SAMPLING_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
         live::prepare(true, 4096);
         RECORDER_ACTIVE.store(true, Ordering::Release);
-        pending.finish(true);
+        pending.finish(0, 0);
         live::record(100, stack, 1024, 1, old_generation);
         assert_eq!(live::sample_count(), 0);
         live::record(100, stack, 2048, 1, generation);
@@ -1869,6 +1903,143 @@ mod tests {
         assert_eq!(count_recorded_samples(), 0);
         assert_eq!(GLOBAL_BUFFERED_SAMPLE_COUNT.load(Ordering::Relaxed), 0);
         MAX_RECORDED_SAMPLES.store(DEFAULT_RING_CAPACITY, Ordering::Relaxed);
+        clear_test_buffers();
+    }
+
+    #[test]
+    fn abandoned_reallocation_token_restores_its_live_slot() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        live::prepare(true, 64);
+        RECORDER_ACTIVE.store(true, Ordering::Release);
+        let _active = RecorderActiveGuard;
+        let generation = SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire);
+        let stack = StackKey {
+            frames: [42; MAX_CAPTURE_DEPTH],
+            depth: 1,
+        };
+        live::record(100, stack, 1024, 1, generation);
+        drop(live::begin_reallocation(100).expect("reserve live slot"));
+        assert_eq!(live::sample_count(), 1);
+        live::remove(100);
+        assert_eq!(live::sample_count(), 0);
+    }
+
+    #[test]
+    fn suppressed_and_reentrant_frees_still_remove_live_metadata() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        live::prepare(true, 4096);
+        RECORDER_ACTIVE.store(true, Ordering::Release);
+        let _active = RecorderActiveGuard;
+        let allocator = SamplingMiMalloc::new();
+        let layout = Layout::from_size_align(1024, 8).expect("layout");
+        let generation = SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire);
+        let stack = StackKey {
+            frames: [42; MAX_CAPTURE_DEPTH],
+            depth: 1,
+        };
+        for reentrant in [false, true] {
+            // SAFETY: Allocate valid storage directly through the wrapped
+            // allocator so the test can install an exact live sample.
+            let pointer = unsafe { allocator.inner.alloc(layout) };
+            assert!(!pointer.is_null());
+            live::record(pointer as usize, stack, 1024, 1, generation);
+            assert_eq!(live::sample_count(), 1);
+            SAMPLER_STATE.with(|sampler| {
+                let mut state = sampler.get();
+                state.in_profiler = reentrant;
+                sampler.set(state);
+            });
+            // SAFETY: The pointer is live and layout matches its allocation.
+            with_profiler_suppressed(|| unsafe { allocator.dealloc(pointer, layout) });
+            SAMPLER_STATE.with(|sampler| {
+                let mut state = sampler.get();
+                state.in_profiler = false;
+                sampler.set(state);
+            });
+            assert_eq!(live::sample_count(), 0);
+        }
+    }
+
+    #[test]
+    fn tracked_reallocation_below_byte_remainder_keeps_live_sample_without_allocation_event() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        clear_test_buffers();
+        live::prepare(true, 4096);
+        RECORDER_ACTIVE.store(true, Ordering::Release);
+        let _active = RecorderActiveGuard;
+        let allocator = SamplingMiMalloc::new();
+        let layout = Layout::from_size_align(1024, 8).expect("layout");
+        for suppressed in [false, true] {
+            let new_size = if suppressed { 1536 } else { 768 };
+            // SAFETY: Allocate valid storage directly through mimalloc.
+            let pointer = unsafe { allocator.inner.alloc(layout) };
+            assert!(!pointer.is_null());
+            let generation = SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire);
+            let stack = StackKey {
+                frames: [42; MAX_CAPTURE_DEPTH],
+                depth: 1,
+            };
+            live::record(pointer as usize, stack, 1024, 1, generation);
+            SAMPLER_STATE.with(|sampler| {
+                let mut state = sampler.get();
+                state.remaining_bytes = 1024 * 1024;
+                state.remaining_config_generation = generation;
+                state.flush_generation = FLUSH_REQUEST_GENERATION.load(Ordering::Relaxed);
+                sampler.set(state);
+            });
+            RECORDED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+            // SAFETY: The pointer is live with the supplied layout.
+            let resize = || unsafe { allocator.realloc(pointer, layout, new_size) };
+            let resized = if suppressed {
+                with_profiler_suppressed(resize)
+            } else {
+                resize()
+            };
+            assert!(!resized.is_null());
+            if !suppressed {
+                assert_eq!(
+                    resized, pointer,
+                    "shrink within the same mimalloc size class"
+                );
+            }
+            assert_eq!(live::sample_count(), 1);
+            assert_eq!(live::snapshot()[0].weighted_bytes, new_size as f64);
+            assert_eq!(live::snapshot()[0].stack, stack);
+            assert_eq!(RECORDED_SAMPLE_COUNT.load(Ordering::Relaxed), 0);
+            // SAFETY: Successful realloc transfers ownership to resized.
+            unsafe { allocator.dealloc(resized, Layout::from_size_align(new_size, 8).unwrap()) };
+        }
+        clear_test_buffers();
+    }
+
+    #[test]
+    fn moved_reallocation_samples_new_physical_allocations_independently() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        clear_test_buffers();
+        let previous_interval = SAMPLE_INTERVAL_BYTES.swap(4096, Ordering::Relaxed);
+        live::prepare(true, 4096);
+        RECORDER_ACTIVE.store(true, Ordering::Release);
+        let _active = RecorderActiveGuard;
+        let allocator = SamplingMiMalloc::new();
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        // SAFETY: A valid layout is supplied to the wrapped allocator.
+        let pointer = unsafe { allocator.inner.alloc(layout) };
+        assert!(!pointer.is_null());
+        assert_eq!(live::sample_count(), 0);
+        // SAFETY: pointer is live and layout matches its original allocation.
+        let replacement = unsafe { allocator.realloc(pointer, layout, 4 * 1024 * 1024) };
+        assert!(!replacement.is_null());
+        assert_ne!(replacement, pointer);
+        assert_eq!(live::sample_count(), 1);
+        assert_eq!(live::snapshot()[0].weighted_bytes, (4 * 1024 * 1024) as f64);
+        // SAFETY: Successful realloc supplies the replacement's ownership/layout.
+        unsafe {
+            allocator.dealloc(
+                replacement,
+                Layout::from_size_align(4 * 1024 * 1024, 8).unwrap(),
+            )
+        };
+        SAMPLE_INTERVAL_BYTES.store(previous_interval, Ordering::Relaxed);
         clear_test_buffers();
     }
 

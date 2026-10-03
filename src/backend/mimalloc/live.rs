@@ -9,7 +9,9 @@ use std::{
     },
 };
 
-use super::{session_is_current, splitmix64, StackKey, SAMPLING_CONFIG_GENERATION};
+use super::{
+    session_is_current, splitmix64, with_profiler_suppressed, StackKey, SAMPLING_CONFIG_GENERATION,
+};
 
 const SHARD_COUNT: usize = 64;
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -26,13 +28,19 @@ struct LiveShard {
 }
 
 struct LiveMap {
-    samples: HashMap<usize, LiveAllocationSample>,
+    samples: HashMap<usize, LiveEntry>,
     capacity: usize,
-    // Detached reallocations retain a slot until success or failure is known.
-    reservations: usize,
     // Exact bit reference counts let the atomic filter reject most untracked
     // frees without a mutex lookup, while never dropping a tracked removal.
     membership_counts: [usize; 64],
+}
+
+#[derive(Copy, Clone)]
+struct LiveEntry {
+    sample: LiveAllocationSample,
+    // Retaining the entry reserves rollback storage and prevents an address
+    // reused by another thread from replacing metadata before realloc completes.
+    reallocating: bool,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -59,7 +67,6 @@ pub(super) fn prepare(enabled: bool, capacity: usize) {
             entries: Mutex::new(LiveMap {
                 samples: HashMap::new(),
                 capacity: 0,
-                reservations: 0,
                 membership_counts: [0; 64],
             }),
             count: AtomicUsize::new(0),
@@ -75,10 +82,9 @@ pub(super) fn prepare(enabled: bool, capacity: usize) {
             entries
                 .samples
                 .capacity()
-                .saturating_mul(std::mem::size_of::<(usize, LiveAllocationSample)>()),
+                .saturating_mul(std::mem::size_of::<(usize, LiveEntry)>()),
         );
         entries.capacity = shard_capacity;
-        entries.reservations = 0;
         entries.membership_counts.fill(0);
         shard.count.store(0, Ordering::Release);
         shard.membership.store(0, Ordering::Release);
@@ -94,7 +100,6 @@ pub(super) fn clear() {
             let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
             entries.samples = HashMap::new();
             entries.capacity = 0;
-            entries.reservations = 0;
             entries.membership_counts.fill(0);
             shard.count.store(0, Ordering::Release);
             shard.membership.store(0, Ordering::Release);
@@ -109,6 +114,11 @@ fn shard_and_bit(pointer: usize) -> (usize, usize) {
 }
 
 impl LiveMap {
+    fn has_capacity(&self) -> bool {
+        // Tombstones can reduce HashMap's insertion capacity after churn.
+        // Never let an allocator hook grow or rebuild the backing table.
+        self.samples.len() < self.capacity && self.samples.len() < self.samples.capacity()
+    }
     fn add_membership(&mut self, shard: &LiveShard, bit: usize) {
         self.membership_counts[bit] += 1;
         shard.membership.fetch_or(1_u64 << bit, Ordering::Release);
@@ -139,22 +149,23 @@ pub(super) fn record(pointer: usize, stack: StackKey, size: u64, interval: u64, 
     if !enabled() || !session_is_current(generation) {
         return;
     }
-    if entries.samples.len() + entries.reservations >= entries.capacity {
+    if !entries.has_capacity() || entries.samples.contains_key(&pointer) {
         DROPPED.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let (weighted_objects, weighted_bytes) = weights(size, interval);
-    let previous = entries.samples.insert(
+    entries.samples.insert(
         pointer,
-        LiveAllocationSample {
-            stack,
-            weighted_objects,
-            weighted_bytes,
+        LiveEntry {
+            sample: LiveAllocationSample {
+                stack,
+                weighted_objects,
+                weighted_bytes,
+            },
+            reallocating: false,
         },
     );
-    if previous.is_none() {
-        entries.add_membership(shard, bit);
-    }
+    entries.add_membership(shard, bit);
 }
 
 // One pointer can cross many Poisson intervals, but contributes one live hit.
@@ -179,18 +190,26 @@ pub(super) fn remove(pointer: usize) {
     // Dropping a removal on contention would fabricate a live allocation.
     // This short critical section never allocates or resolves symbols.
     let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
-    if entries.samples.remove(&pointer).is_some() {
+    // A different allocation may already reuse the address freed by mimalloc
+    // during an in-flight realloc. That allocation was not admitted to this
+    // reserved slot, and must not remove the original realloc token's entry.
+    if entries
+        .samples
+        .get(&pointer)
+        .is_some_and(|entry| !entry.reallocating)
+    {
+        entries.samples.remove(&pointer);
         entries.remove_membership(shard, bit);
     }
 }
 
 pub(super) struct PendingReallocation {
     pointer: usize,
-    sample: LiveAllocationSample,
     generation: u64,
+    finished: bool,
 }
 
-pub(super) fn detach(pointer: usize) -> Option<PendingReallocation> {
+pub(super) fn begin_reallocation(pointer: usize) -> Option<PendingReallocation> {
     let shards = SHARDS.get()?;
     let (index, bit) = shard_and_bit(pointer);
     let shard = &shards[index];
@@ -198,35 +217,91 @@ pub(super) fn detach(pointer: usize) -> Option<PendingReallocation> {
         return None;
     }
     let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
-    let sample = entries.samples.remove(&pointer)?;
-    entries.reservations += 1;
-    entries.remove_membership(shard, bit);
+    let entry = entries.samples.get_mut(&pointer)?;
+    if entry.reallocating {
+        return None;
+    }
+    entry.reallocating = true;
     Some(PendingReallocation {
         pointer,
-        sample,
         generation: SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire),
+        finished: false,
     })
 }
 
 impl PendingReallocation {
-    pub(super) fn finish(self, failed: bool) {
-        let Some(shards) = SHARDS.get() else {
-            return;
-        };
+    pub(super) fn finish(
+        mut self,
+        new_pointer: usize,
+        new_size: u64,
+    ) -> Option<(LiveAllocationSample, u64)> {
+        self.finished = true;
+        let shards = SHARDS.get()?;
         let (index, bit) = shard_and_bit(self.pointer);
         let shard = &shards[index];
         let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
         if !enabled() || !session_is_current(self.generation) {
+            return None;
+        }
+        let entry = entries.samples.get_mut(&self.pointer)?;
+        if new_pointer == 0 || new_pointer == self.pointer {
+            entry.reallocating = false;
+            if new_pointer != 0 {
+                entry.sample.weighted_bytes = entry.sample.weighted_objects * new_size as f64;
+            }
+            return None;
+        }
+        let entry = entries.samples.remove(&self.pointer)?;
+        let mut sample = entry.sample;
+        entries.remove_membership(shard, bit);
+        drop(entries);
+        sample.weighted_bytes = sample.weighted_objects * new_size as f64;
+        Some((sample, self.generation))
+    }
+}
+
+impl Drop for PendingReallocation {
+    fn drop(&mut self) {
+        if self.finished {
             return;
         }
-        entries.reservations -= 1;
-        if failed {
-            // The allocator kept the original pointer alive. Its reserved slot
-            // guarantees rollback even if other threads filled this shard.
-            entries.samples.insert(self.pointer, self.sample);
-            entries.add_membership(shard, bit);
-        }
+        with_profiler_suppressed(|| {
+            let Some(shards) = SHARDS.get() else {
+                return;
+            };
+            let shard = &shards[shard_and_bit(self.pointer).0];
+            let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
+            if enabled() && session_is_current(self.generation) {
+                if let Some(entry) = entries.samples.get_mut(&self.pointer) {
+                    entry.reallocating = false;
+                }
+            }
+        });
     }
+}
+
+pub(super) fn transfer_sample(pointer: usize, sample: LiveAllocationSample, generation: u64) {
+    let Some(shards) = SHARDS.get() else {
+        return;
+    };
+    let (index, bit) = shard_and_bit(pointer);
+    let shard = &shards[index];
+    let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
+    if !enabled() || !session_is_current(generation) {
+        return;
+    }
+    if !entries.has_capacity() || entries.samples.contains_key(&pointer) {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    entries.samples.insert(
+        pointer,
+        LiveEntry {
+            sample,
+            reallocating: false,
+        },
+    );
+    entries.add_membership(shard, bit);
 }
 
 pub(super) fn snapshot() -> Vec<LiveAllocationSample> {
@@ -240,14 +315,30 @@ pub(super) fn snapshot() -> Vec<LiveAllocationSample> {
     for shard in shards {
         // Allocate the output storage before taking a shard lock. Samples are
         // copied under the lock, with aggregation/symbolization done afterward.
-        let capacity = shard
-            .entries
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .capacity;
+        let (capacity, rebuild) = {
+            let entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
+            (
+                entries.capacity,
+                entries.samples.capacity() < entries.capacity,
+            )
+        };
+        let mut replacement = rebuild.then(|| HashMap::with_capacity(capacity));
         samples.reserve(capacity);
-        let entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
-        samples.extend(entries.samples.values().copied());
+        let mut entries = shard.entries.lock().unwrap_or_else(|err| err.into_inner());
+        let old = replacement.take().map(|mut replacement| {
+            replacement.extend(
+                entries
+                    .samples
+                    .iter()
+                    .map(|(pointer, entry)| (*pointer, *entry)),
+            );
+            std::mem::replace(&mut entries.samples, replacement)
+        });
+        samples.extend(entries.samples.values().map(|entry| entry.sample));
+        drop(entries);
+        // Rebuilding happens only during reporting. Free the old table outside
+        // its shard lock so allocator metadata cleanup cannot recurse into it.
+        drop(old);
     }
     samples
 }

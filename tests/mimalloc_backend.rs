@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn live_heap_resamples_successful_reallocation_and_preserves_failed_reallocation() {
+    fn live_heap_maintains_physical_allocation_samples_through_reallocation_and_failure() {
         let _guard = TEST_LOCK.lock().expect("lock realloc live test");
         let mut backend = live_backend();
         let old_size = 2 * 1024 * 1024;
@@ -214,26 +214,29 @@ mod tests {
         // SAFETY: pointer is live and its layout matches the original request.
         let new_pointer = unsafe { resize_live_test(pointer as *mut u8, old_layout, new_size) };
         assert!(!new_pointer.is_null());
+        let origin = if new_pointer == pointer as *mut u8 {
+            "allocate_zeroed_live_test"
+        } else {
+            "resize_live_test"
+        };
         let grown = report_profile(&mut backend);
         assert_eq!(
-            sample_value_for_frame(&grown, "allocate_zeroed_live_test", "inuse_space"),
-            0
-        );
-        assert_eq!(
-            sample_value_for_frame(&grown, "resize_live_test", "inuse_space"),
+            sample_value_for_frame(&grown, origin, "inuse_space"),
             new_size as i64
         );
 
         let new_layout = Layout::from_size_align(new_size, 8).unwrap();
+        let samples_before_same_size = mimalloc_stats().recorded_samples;
         // SAFETY: The replacement is live with the layout supplied above.
         let same_pointer = unsafe { resize_live_test(new_pointer, new_layout, new_size) };
         assert_eq!(
             same_pointer, new_pointer,
             "same-size mimalloc realloc should retain its address"
         );
+        assert_eq!(mimalloc_stats().recorded_samples, samples_before_same_size);
         let in_place = report_profile(&mut backend);
         assert_eq!(
-            sample_value_for_frame(&in_place, "resize_live_test", "inuse_space"),
+            sample_value_for_frame(&in_place, origin, "inuse_space"),
             new_size as i64
         );
         // SAFETY: This valid but unfulfillable request exercises the allocator's
@@ -245,16 +248,21 @@ mod tests {
         );
         let after_failure = report_profile(&mut backend);
         assert_eq!(
-            sample_value_for_frame(&after_failure, "resize_live_test", "inuse_space"),
+            sample_value_for_frame(&after_failure, origin, "inuse_space"),
             new_size as i64
         );
         let shrunk_size = 1024 * 1024;
         // SAFETY: Failed realloc preserves new_pointer and its original layout.
         let shrunk_pointer = unsafe { resize_live_test(new_pointer, new_layout, shrunk_size) };
         assert!(!shrunk_pointer.is_null());
+        let shrunk_origin = if shrunk_pointer == new_pointer {
+            origin
+        } else {
+            "resize_live_test"
+        };
         let shrunk = report_profile(&mut backend);
         assert_eq!(
-            sample_value_for_frame(&shrunk, "resize_live_test", "inuse_space"),
+            sample_value_for_frame(&shrunk, shrunk_origin, "inuse_space"),
             shrunk_size as i64
         );
         // SAFETY: Successful realloc transfers ownership to shrunk_pointer.
@@ -266,7 +274,7 @@ mod tests {
         };
         let freed = report_profile(&mut backend);
         assert_eq!(
-            sample_value_for_frame(&freed, "resize_live_test", "inuse_space"),
+            sample_value_for_frame(&freed, shrunk_origin, "inuse_space"),
             0
         );
         backend.shutdown().expect("shutdown live heap backend");

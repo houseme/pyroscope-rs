@@ -61,8 +61,14 @@ let backend = mimalloc_backend(MimallocConfig {
 Live tracking covers Rust allocations made through `SamplingMiMalloc` after
 initialization, including cross-thread frees and reallocations. It reports
 sampling-weighted requested sizes, not allocator usable sizes or allocations
-made directly by native libraries. Its metadata is bounded and preallocated;
-full or contended shards omit new live samples, exposed by
+made directly by native libraries. Sampling starts on `alloc` / `alloc_zeroed`.
+Same-address reallocations preserve the original stack and sampling weight
+while updating size. Moving reallocations independently sample the replacement
+allocation, including replacements of previously untracked objects. Enabling live tracking
+does not change the interval `alloc_*` accounting for reallocations.
+
+Metadata is bounded, preallocated, and partitioned across shards. Full or
+contended shards can omit new live samples, exposed by
 `mimalloc_stats().dropped_live_samples`. Freeing a tracked pointer reliably
 removes it, which may briefly wait for its shard lock. Reports copy shards one
 at a time, so concurrent heap snapshots are approximate rather than atomic.
