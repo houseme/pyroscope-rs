@@ -90,10 +90,26 @@ debug = 1
 strip = "none"
 ```
 
-This backend does not yet export executable mappings or build IDs for external
-symbolization. The upload path is covered by loopback HTTP integration tests
+On Linux and Apple platforms, reports include executable mappings, file offsets,
+and available build IDs (GNU build IDs or Mach-O UUIDs). Linux offsets are read
+only from ELF files whose build ID matches the loaded image; unavailable or
+unverifiable mappings remain unset. Other platforms retain addresses and local
+symbols without mappings. Image metadata is collected at report time, not in
+allocation hooks. Applications that dynamically unload code must keep sampled
+images loaded until reporting; Apple image enumeration also requires that
+applications avoid concurrent library loading or unloading during reports.
+The upload path is covered by loopback HTTP integration tests
 for memory profiles, gzip payloads, authentication, tenant headers, and labels;
 these tests do not replace validation against a deployed Pyroscope server.
+
+For offline inspection, the overhead example can export a gzipped memory profile
+after shutdown, outside the timed workload:
+
+```bash
+MIMALLOC_BENCH_MODE=live MIMALLOC_BENCH_PPROF_PATH=target/mimalloc.pprof.gz \
+  cargo run --example mimalloc_overhead --features backend-mimalloc
+go tool pprof -sample_index=inuse_space -top target/mimalloc.pprof.gz
+```
 
 Useful local checks:
 

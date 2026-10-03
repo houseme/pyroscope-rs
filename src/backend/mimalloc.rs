@@ -8,6 +8,7 @@
 //! Optional live heap tracking maintains sampled pointers in bounded shards.
 
 mod live;
+mod mappings;
 
 use std::{
     alloc::{GlobalAlloc, Layout},
@@ -367,7 +368,8 @@ pub struct MimallocStats {
     pub dropped_samples: u64,
     /// Number of samples currently buffered for the next report, if the buffer lock is available.
     pub buffered_samples: Option<usize>,
-    /// Duration of the most recent pprof encoding step in microseconds.
+    /// Duration of the most recent image-metadata collection and pprof encoding
+    /// step in microseconds, excluding stack resolution and sample aggregation.
     pub last_pprof_encode_elapsed_micros: u64,
     /// Number of sampled live pointers currently retained (zero when disabled).
     pub live_samples: usize,
@@ -690,11 +692,13 @@ impl Backend for Mimalloc {
             let samples = build_memory_samples(recorded, live::snapshot(), self.config.max_depth);
 
             let encode_start = Instant::now();
-            let pprof_data = memory_pprof::encode_memory_profile(
+            let mappings = mappings::collect(&samples);
+            let pprof_data = memory_pprof::encode_memory_profile_with_mappings(
                 &samples,
                 self.config.sample_interval_bytes,
                 duration_nanos,
                 self.config.live_heap_tracking,
+                &mappings,
             );
             LAST_PPROF_ENCODE_ELAPSED_MICROS.store(
                 duration_to_u64_micros(encode_start.elapsed()),
@@ -1526,13 +1530,16 @@ fn resolve_stack_with(
 }
 
 fn resolve_frame(ip: usize) -> MemoryFrame {
+    // backtrace resolves return addresses at IP - 1 internally. Export the
+    // same instruction so offline symbolizers see the call site too.
+    let address = ip.saturating_sub(1) as u64;
     let mut resolved = Vec::new();
     backtrace::resolve(ip as *mut std::ffi::c_void, |symbol| {
         resolved.push(MemorySymbol {
             name: symbol
                 .name()
                 .map(|name| name.to_string())
-                .unwrap_or_else(|| format!("0x{ip:x}")),
+                .unwrap_or_else(|| format!("0x{address:x}")),
             filename: symbol
                 .filename()
                 .map(|path| path.to_string_lossy().into_owned()),
@@ -1541,13 +1548,13 @@ fn resolve_frame(ip: usize) -> MemoryFrame {
     });
     if resolved.is_empty() {
         resolved.push(MemorySymbol {
-            name: format!("0x{ip:x}"),
+            name: format!("0x{address:x}"),
             filename: None,
             line: 0,
         });
     }
     MemoryFrame {
-        address: ip as u64,
+        address,
         symbols: resolved,
     }
 }
@@ -2699,6 +2706,13 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].alloc_objects, 12);
         assert_eq!(samples[0].alloc_space, 2048);
+    }
+
+    #[test]
+    fn resolved_frame_address_matches_backtrace_call_site_adjustment() {
+        let address = resolve_frame as *const () as usize;
+        assert_eq!(resolve_frame(address + 1).address, address as u64);
+        assert_eq!(resolve_frame(0).address, 0);
     }
 
     #[test]

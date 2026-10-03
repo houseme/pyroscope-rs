@@ -6,7 +6,16 @@ use std::{
 
 use prost::Message;
 
-use crate::encode::gen::google::{Function, Line, Location, Profile, Sample, ValueType};
+use crate::encode::gen::google::{Function, Line, Location, Mapping, Profile, Sample, ValueType};
+
+/// A verified executable segment in the process's runtime address space.
+pub(crate) struct MemoryMapping {
+    pub memory_start: u64,
+    pub memory_limit: u64,
+    pub file_offset: u64,
+    pub filename: String,
+    pub build_id: String,
+}
 
 /// A memory allocation sample ready to be encoded into pprof.
 #[derive(Debug, Clone)]
@@ -81,6 +90,9 @@ struct PprofMemoryBuilder {
     locations: HashMap<LocationKey, u64>,
     // Keep an owning reference so identity-cache addresses cannot be reused.
     frames: HashMap<usize, (Arc<MemoryFrame>, u64)>,
+    // Sorted independently from the pprof mappings, whose first entry is the main binary.
+    mapping_ranges: Vec<(u64, u64, usize)>,
+    mapping_seen: Vec<bool>,
     live_heap: bool,
 }
 
@@ -107,6 +119,8 @@ impl PprofMemoryBuilder {
             functions: HashMap::new(),
             locations: HashMap::new(),
             frames: HashMap::new(),
+            mapping_ranges: Vec::new(),
+            mapping_seen: Vec::new(),
             live_heap,
         };
 
@@ -149,6 +163,42 @@ impl PprofMemoryBuilder {
         builder
     }
 
+    fn add_mappings(&mut self, mappings: &[MemoryMapping]) {
+        for mapping in mappings {
+            if mapping.memory_start >= mapping.memory_limit {
+                continue;
+            }
+            let filename = self.add_string(&mapping.filename);
+            let build_id = self.add_string(&mapping.build_id);
+            let index = self.profile.mapping.len();
+            self.profile.mapping.push(Mapping {
+                id: index as u64 + 1,
+                memory_start: mapping.memory_start,
+                memory_limit: mapping.memory_limit,
+                file_offset: mapping.file_offset,
+                filename,
+                build_id,
+                ..Mapping::default()
+            });
+            self.mapping_ranges
+                .push((mapping.memory_start, mapping.memory_limit, index));
+            self.mapping_seen.push(false);
+        }
+        self.mapping_ranges.sort_unstable_by_key(|range| range.0);
+    }
+
+    fn mapping_index(&self, address: u64) -> Option<usize> {
+        if address == 0 {
+            return None;
+        }
+        let index = self
+            .mapping_ranges
+            .partition_point(|range| range.0 <= address)
+            .checked_sub(1)?;
+        let (_, limit, mapping) = self.mapping_ranges[index];
+        (address < limit).then_some(mapping)
+    }
+
     fn add_string(&mut self, value: &str) -> i64 {
         if let Some(id) = self.strings.get(value) {
             return *id;
@@ -165,6 +215,40 @@ impl PprofMemoryBuilder {
         if let Some((_, location_id)) = self.frames.get(&identity) {
             return *location_id;
         }
+        let mapping_id = self.mapping_index(frame.address).map_or(0, |index| {
+            let symbols = &frame.symbols;
+            let has_functions = !symbols.is_empty()
+                && symbols.iter().all(|symbol| {
+                    !symbol.name.is_empty()
+                        && symbol
+                            .name
+                            .strip_prefix("0x")
+                            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                            != Some(frame.address)
+                });
+            let has_filenames = has_functions
+                && symbols.iter().all(|symbol| {
+                    symbol
+                        .filename
+                        .as_ref()
+                        .is_some_and(|name| !name.is_empty())
+                });
+            let has_lines = has_filenames && symbols.iter().all(|symbol| symbol.line > 0);
+            let mapping = &mut self.profile.mapping[index];
+            // A partial mapping must remain eligible for offline symbolization.
+            if self.mapping_seen[index] {
+                mapping.has_functions &= has_functions;
+                mapping.has_filenames &= has_filenames;
+                mapping.has_line_numbers &= has_lines;
+            } else {
+                mapping.has_functions = has_functions;
+                mapping.has_filenames = has_filenames;
+                mapping.has_line_numbers = has_lines;
+                self.mapping_seen[index] = true;
+            }
+            mapping.has_inline_frames |= symbols.len() > 1;
+            mapping.id
+        });
         let lines: Vec<_> = frame
             .symbols
             .iter()
@@ -200,7 +284,7 @@ impl PprofMemoryBuilder {
             let id = self.profile.location.len() as u64 + 1;
             self.profile.location.push(Location {
                 id,
-                mapping_id: 0,
+                mapping_id,
                 address: key.address,
                 line: key.lines.clone(),
                 is_folded: false,
@@ -251,8 +335,19 @@ pub fn encode_memory_profile(
     duration_nanos: i64,
     live_heap: bool,
 ) -> Vec<u8> {
+    encode_memory_profile_with_mappings(samples, period, duration_nanos, live_heap, &[])
+}
+
+pub(crate) fn encode_memory_profile_with_mappings(
+    samples: &[AllocationSample],
+    period: u64,
+    duration_nanos: i64,
+    live_heap: bool,
+    mappings: &[MemoryMapping],
+) -> Vec<u8> {
     let period = i64::try_from(period).unwrap_or(i64::MAX);
     let mut builder = PprofMemoryBuilder::new(period, duration_nanos, live_heap);
+    builder.add_mappings(mappings);
 
     for sample in samples {
         builder.add_sample(sample);
@@ -419,5 +514,122 @@ mod tests {
             Profile::decode(encode_allocation_profile(&[sample], 1024, 0).as_slice()).unwrap();
         assert_eq!(profile.location.len(), 1);
         assert_eq!(profile.function.len(), 1);
+    }
+
+    #[test]
+    fn mappings_preserve_runtime_addresses_offsets_and_symbol_metadata() {
+        let mappings = [
+            MemoryMapping {
+                memory_start: 0x8000,
+                memory_limit: 0x9000,
+                file_offset: 0x2000,
+                filename: "app".into(),
+                build_id: "abcd1234".into(),
+            },
+            MemoryMapping {
+                memory_start: 0x1000,
+                memory_limit: 0x2000,
+                file_offset: 0x4000,
+                filename: "library.so".into(),
+                build_id: String::new(),
+            },
+        ];
+        let inline = Arc::new(MemoryFrame {
+            address: 0x8010,
+            symbols: vec![
+                MemorySymbol {
+                    name: "allocate".into(),
+                    filename: Some("allocator.rs".into()),
+                    line: 17,
+                },
+                MemorySymbol {
+                    name: "caller".into(),
+                    filename: Some("app.rs".into()),
+                    line: 29,
+                },
+            ],
+        });
+        let mut sample = AllocationSample::new(vec!["synthetic".into()], 1, 512);
+        sample.frames.extend([
+            inline.clone(),
+            inline,
+            Arc::new(MemoryFrame {
+                address: 0x1000,
+                symbols: vec![MemorySymbol {
+                    name: "0x1000".into(),
+                    filename: None,
+                    line: 0,
+                }],
+            }),
+            Arc::new(MemoryFrame {
+                address: 0x2000,
+                symbols: Vec::new(),
+            }),
+        ]);
+        let bytes = encode_memory_profile_with_mappings(&[sample], 4096, 42, false, &mappings);
+        let profile = Profile::decode(bytes.as_slice()).unwrap();
+        assert_eq!(profile.mapping.len(), 2);
+        let main = &profile.mapping[0];
+        assert_eq!(main.id, 1);
+        assert_eq!(main.file_offset, 0x2000);
+        assert_eq!(profile.string_table[main.filename as usize], "app");
+        assert_eq!(profile.string_table[main.build_id as usize], "abcd1234");
+        assert!(main.has_functions && main.has_filenames && main.has_line_numbers);
+        assert!(main.has_inline_frames);
+        let mapped = profile
+            .location
+            .iter()
+            .find(|location| location.address == 0x8010)
+            .unwrap();
+        assert_eq!(mapped.mapping_id, main.id);
+        assert_eq!(mapped.line.len(), 2);
+        assert!(profile
+            .location
+            .iter()
+            .any(|location| location.address == 0x1000 && location.mapping_id == 2));
+        assert!(profile
+            .location
+            .iter()
+            .any(|location| location.address == 0x2000 && location.mapping_id == 0));
+        assert!(profile
+            .location
+            .iter()
+            .any(|location| location.address == 0 && location.mapping_id == 0));
+        assert!(!profile.mapping[1].has_functions);
+        assert_eq!(profile.mapping[1].build_id, 0);
+        assert_eq!(
+            profile.sample[0].location_id[1],
+            profile.sample[0].location_id[2]
+        );
+    }
+
+    #[test]
+    fn partially_symbolized_mapping_remains_eligible_for_offline_resolution() {
+        let mappings = [MemoryMapping {
+            memory_start: 0x1000,
+            memory_limit: 0x2000,
+            file_offset: 0,
+            filename: "app".into(),
+            build_id: "1234".into(),
+        }];
+        let mut sample = AllocationSample::new(Vec::new(), 1, 512);
+        sample.frames = vec![
+            Arc::new(MemoryFrame {
+                address: 0x1010,
+                symbols: vec![MemorySymbol {
+                    name: "allocate".into(),
+                    filename: Some("allocator.rs".into()),
+                    line: 17,
+                }],
+            }),
+            Arc::new(MemoryFrame {
+                address: 0x1020,
+                symbols: Vec::new(),
+            }),
+        ];
+        let bytes = encode_memory_profile_with_mappings(&[sample], 4096, 0, false, &mappings);
+        let profile = Profile::decode(bytes.as_slice()).unwrap();
+        let mapping = &profile.mapping[0];
+        assert!(!mapping.has_functions && !mapping.has_filenames && !mapping.has_line_numbers);
     }
 }

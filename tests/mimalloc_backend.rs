@@ -53,6 +53,30 @@ mod tests {
                     .iter()
                     .any(|line| line.function_id == function.id && line.line > 0)
         }));
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        {
+            let location = expected
+                .location
+                .iter()
+                .find(|location| {
+                    location
+                        .line
+                        .iter()
+                        .any(|line| line.function_id == function.id)
+                })
+                .unwrap();
+            let mapping = expected
+                .mapping
+                .iter()
+                .find(|mapping| mapping.id == location.mapping_id)
+                .expect("retained allocation executable mapping");
+            assert_eq!(mapping.id, expected.mapping[0].id);
+            assert!(
+                mapping.memory_start <= location.address && location.address < mapping.memory_limit
+            );
+            assert!(!expected.string_table[mapping.filename as usize].is_empty());
+            assert!(!expected.string_table[mapping.build_id as usize].is_empty());
+        }
         assert_eq!(
             sample_value_for_frame(&expected, "allocate_retained_live_test", "inuse_space"),
             retained.len() as i64

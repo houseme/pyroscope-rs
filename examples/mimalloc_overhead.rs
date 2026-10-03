@@ -101,6 +101,16 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
     );
 
     backend.shutdown()?;
+    if let (Some(path), ReportData::RawPprof(bytes)) =
+        (std::env::var_os("MIMALLOC_BENCH_PPROF_PATH"), report.data)
+    {
+        use std::io::Write;
+        // Export after shutdown and outside both throughput and report timing.
+        let file = std::fs::File::create(path)?;
+        let mut gzip = libflate::gzip::Encoder::new(file)?;
+        gzip.write_all(&bytes)?;
+        gzip.finish().into_result()?;
+    }
     Ok(())
 }
 
