@@ -74,6 +74,38 @@ jobs:
           RUSTDOCFLAGS: --cfg docsrs -Dwarnings
         run: cargo doc --lib --no-deps --locked --all-features
 
+  mimalloc-release:
+    name: mimalloc release (${{ matrix.os }}, ${{ matrix.profile.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+        profile:
+          - name: stripped
+            debug: "0"
+            strip: symbols
+            expect_source: "0"
+          - name: source
+            debug: "1"
+            strip: none
+            expect_source: "1"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.96
+
+      - name: Verify optimized mimalloc profile quality and lifecycle
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: ${{ matrix.profile.debug }}
+          CARGO_PROFILE_RELEASE_STRIP: ${{ matrix.profile.strip }}
+          MIMALLOC_TEST_EXPECT_SOURCE: ${{ matrix.profile.expect_source }}
+        run: cargo test --release --locked --no-default-features --features backend-mimalloc --test mimalloc_release
+
   mimalloc-benchmark:
     name: mimalloc benchmark report
     runs-on: ${{ github.repository_owner == 'grafana' && 'ubuntu-x64-small' || 'ubuntu-latest' }}

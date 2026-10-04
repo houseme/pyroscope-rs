@@ -87,6 +87,8 @@ available. Rust display names omit hash/disambiguator decorations, while
 frames are filtered once per resolved address and shared across stacks.
 Unresolved addresses keep an empty location line table, allowing downstream
 symbolizers to fill them without mistaking an address string for a function.
+Stripped Apple builds also leave Mach-O image-header fallback symbols unresolved
+instead of presenting them as functions; physical addresses and mappings remain.
 To retain source information in optimized builds:
 
 ```toml
@@ -101,6 +103,15 @@ MT-Safe libc interface without taking backtrace-rs's shared lock, and warms the
 unwinder before recording starts. Symbolization remains in `report()`. The
 portable engine stays the default: native capture is not universally faster,
 and initialization rejects it on musl, Apple, Windows, and other targets.
+CI checks optimized stripped and source-enabled profiles on Linux and macOS,
+including physical call chains, mapping IDs, live retention, and cross-thread
+release. The source-enabled variant also requires user filenames and lines.
+
+```bash
+cargo test --release --locked --no-default-features --features backend-mimalloc --test mimalloc_release
+CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none MIMALLOC_TEST_EXPECT_SOURCE=1 \
+  cargo test --release --locked --no-default-features --features backend-mimalloc --test mimalloc_release
+```
 
 On Linux and Apple platforms, reports include executable mappings, file offsets,
 and available build IDs (GNU build IDs or Mach-O UUIDs). Linux offsets are read

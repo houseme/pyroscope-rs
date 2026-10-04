@@ -1620,6 +1620,12 @@ fn resolve_frame(ip: usize) -> MemoryFrame {
         let Some(name) = symbol.name().filter(|name| !name.as_bytes().is_empty()) else {
             return;
         };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if is_macho_header_symbol(name.as_bytes()) {
+            // A stripped Mach-O's nearest symbol can be its image header, not
+            // a function. Keep the IP unresolved for downstream symbolization.
+            return;
+        }
         resolved.push(MemorySymbol {
             name: format!("{name:#}"),
             system_name: Some(String::from_utf8_lossy(name.as_bytes()).into_owned()),
@@ -1633,6 +1639,23 @@ fn resolve_frame(ip: usize) -> MemoryFrame {
         address,
         symbols: resolved,
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
+fn is_macho_header_symbol(name: &[u8]) -> bool {
+    // Symbol tables and dladdr use different leading-underscore conventions.
+    let Some(name) = name.strip_prefix(b"__").or_else(|| name.strip_prefix(b"_")) else {
+        return false;
+    };
+    matches!(
+        name,
+        b"mh_execute_header"
+            | b"mh_dylib_header"
+            | b"mh_bundle_header"
+            | b"mh_object_header"
+            | b"mh_preload_header"
+            | b"mh_dylinker_header"
+    )
 }
 
 fn is_mimalloc_profiler_frame(name: &str) -> bool {
@@ -2900,6 +2923,28 @@ mod tests {
         let address = resolve_frame as *const () as usize;
         assert_eq!(resolve_frame(address + 1).address, address as u64);
         assert_eq!(resolve_frame(0).address, 0);
+    }
+
+    #[test]
+    fn macho_image_headers_are_not_function_symbols() {
+        for kind in [
+            "execute", "dylib", "bundle", "object", "preload", "dylinker",
+        ] {
+            for prefix in ["_", "__"] {
+                assert!(is_macho_header_symbol(
+                    format!("{prefix}mh_{kind}_header").as_bytes()
+                ));
+            }
+        }
+        for name in [
+            "mh_execute_header",
+            "___mh_execute_header",
+            "__mh_execute_header_suffix",
+            "application::__mh_execute_header",
+            "application::allocate",
+        ] {
+            assert!(!is_macho_header_symbol(name.as_bytes()));
+        }
     }
 
     #[test]
