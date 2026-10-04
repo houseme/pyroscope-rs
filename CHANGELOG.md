@@ -9,6 +9,7 @@
 - Preserve instruction addresses, inline symbol chains, filenames, and source lines in mimalloc memory pprof. Share resolved frames across stacks and validate memory uploads through loopback HTTP, including gzip profiles, authentication, tenant headers, and agent labels.
 - Include executable mappings and build IDs in mimalloc reports on Linux and Apple platforms, with verified ELF file offsets and conservative symbolization flags. Collect metadata only during reporting and use indexed address lookup without adding allocator-hook work.
 - Normalize Rust symbol display names before removing profiler frames, preserve original pprof system names, and share filtered inline frames across stacks. Keep unresolved addresses eligible for downstream symbolization instead of creating fake address-named functions.
+- Expose completed mimalloc report and drained allocation-record counters. Add concurrent periodic-report benchmark scenarios, record-drop quality gates, replay classification regressions, and versioned v3 history without treating pressure-drop throughput as lossless profiling overhead.
 
 
 ## [2.1.1](https://github.com/grafana/pyroscope-rs/compare/lib-2.1.0...lib-2.1.1) (2026-07-21)

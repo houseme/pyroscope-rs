@@ -32,6 +32,9 @@ mod tests {
         let mut backend = live_backend();
         let retained = allocate_retained_live_test(2 * 1024 * 1024);
         let batch = backend.report().expect("collect live heap profile");
+        let report_stats = mimalloc_stats();
+        assert_eq!(report_stats.reports, 1);
+        assert!(report_stats.reported_samples > 0);
         let ReportData::RawPprof(ref bytes) = batch.data else {
             panic!("raw memory profile expected");
         };
@@ -142,6 +145,8 @@ mod tests {
         })
         .initialize()
         .expect("initialize mimalloc backend");
+        assert_eq!(mimalloc_stats().reports, 0);
+        assert_eq!(mimalloc_stats().reported_samples, 0);
 
         let allocations: Vec<Vec<u8>> = (0..4096).map(|_| vec![0_u8; 1024]).collect();
         std::hint::black_box(&allocations);

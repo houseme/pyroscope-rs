@@ -63,6 +63,8 @@ static NEXT_DRAINED_SAMPLE_SHARD: AtomicUsize = AtomicUsize::new(0);
 static NEXT_REPORT_SOURCE: AtomicUsize = AtomicUsize::new(0);
 static NEXT_TLS_DRAIN_BUFFER: AtomicUsize = AtomicUsize::new(0);
 static RECORDED_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+static REPORTED_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
+static REPORT_COUNT: AtomicU64 = AtomicU64::new(0);
 static FLUSH_COUNT: AtomicU64 = AtomicU64::new(0);
 static FLUSHED_SAMPLE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DROPPED_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -360,6 +362,11 @@ pub struct MimallocConfig {
 pub struct MimallocStats {
     /// Number of samples accepted into the recorder since backend initialization.
     pub recorded_samples: u64,
+    /// Allocation records encoded into completed reports, before stack aggregation.
+    /// Does not count live entries repeatedly included in heap snapshots or uploads.
+    pub reported_samples: u64,
+    /// Number of successfully encoded reports since initialization, including empty reports.
+    pub reports: u64,
     /// Number of successful TLS-to-global or TLS-to-report flushes since initialization.
     pub flushes: u64,
     /// Number of samples moved from TLS rings into global buffers or reports.
@@ -388,6 +395,8 @@ pub fn mimalloc_stats() -> MimallocStats {
 
     MimallocStats {
         recorded_samples: RECORDED_SAMPLE_COUNT.load(Ordering::Relaxed),
+        reported_samples: REPORTED_SAMPLE_COUNT.load(Ordering::Relaxed),
+        reports: REPORT_COUNT.load(Ordering::Relaxed),
         flushes: FLUSH_COUNT.load(Ordering::Relaxed),
         flushed_samples: FLUSHED_SAMPLE_COUNT.load(Ordering::Relaxed),
         dropped_samples: DROPPED_SAMPLES.load(Ordering::Relaxed),
@@ -640,6 +649,8 @@ impl Backend for Mimalloc {
             NEXT_TLS_DRAIN_BUFFER.store(0, Ordering::Relaxed);
             MAX_RECORDED_SAMPLES.store(self.config.ring_capacity, Ordering::Relaxed);
             RECORDED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+            REPORTED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+            REPORT_COUNT.store(0, Ordering::Relaxed);
             FLUSH_COUNT.store(0, Ordering::Relaxed);
             FLUSHED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
             DROPPED_SAMPLES.store(0, Ordering::Relaxed);
@@ -704,6 +715,8 @@ impl Backend for Mimalloc {
                 duration_to_u64_micros(encode_start.elapsed()),
                 Ordering::Relaxed,
             );
+            REPORTED_SAMPLE_COUNT.fetch_add(recorded_count as u64, Ordering::Relaxed);
+            REPORT_COUNT.fetch_add(1, Ordering::Relaxed);
 
             Ok(ReportBatch {
                 profile_type: "memory".into(),
@@ -1741,6 +1754,57 @@ mod tests {
     }
 
     #[test]
+    fn report_counters_count_raw_drains_not_repeated_live_snapshots_and_reset() {
+        let _guard = TEST_LOCK.lock().expect("lock test");
+        let previous_seen = ALLOCATOR_SEEN.swap(true, Ordering::Relaxed);
+        let mut backend = Mimalloc::new(MimallocConfig {
+            ring_capacity: 16,
+            report_drain_limit: 1,
+            live_heap_tracking: true,
+            max_live_samples: 128,
+            ..MimallocConfig::default()
+        });
+        backend.initialize().unwrap();
+        let stack = StackKey {
+            frames: [0; MAX_CAPTURE_DEPTH],
+            depth: 0,
+        };
+        push_global_test_samples([test_sample(stack), test_sample(stack)]);
+        live::record(
+            100,
+            stack,
+            1024,
+            1,
+            SAMPLING_CONFIG_GENERATION.load(Ordering::Acquire),
+        );
+        backend.report().unwrap();
+        assert_eq!(
+            (mimalloc_stats().reports, mimalloc_stats().reported_samples),
+            (1, 1)
+        );
+        backend.report().unwrap();
+        assert_eq!(
+            (mimalloc_stats().reports, mimalloc_stats().reported_samples),
+            (2, 2)
+        );
+        backend.report().unwrap();
+        assert_eq!(
+            (mimalloc_stats().reports, mimalloc_stats().reported_samples),
+            (3, 2)
+        );
+        drop(backend);
+        let mut restarted = Mimalloc::new(MimallocConfig::default());
+        restarted.initialize().unwrap();
+        assert_eq!(
+            (mimalloc_stats().reports, mimalloc_stats().reported_samples),
+            (0, 0)
+        );
+        drop(restarted);
+        ALLOCATOR_SEEN.store(previous_seen, Ordering::Relaxed);
+        clear_test_buffers();
+    }
+
+    #[test]
     fn live_snapshot_survives_reports_and_cross_thread_free() {
         let _guard = TEST_LOCK.lock().expect("lock test");
         live::prepare(true, 4096);
@@ -1912,6 +1976,8 @@ mod tests {
         let _guard = TEST_LOCK.lock().expect("lock test");
         clear_test_buffers();
         RECORDED_SAMPLE_COUNT.store(7, Ordering::Relaxed);
+        REPORTED_SAMPLE_COUNT.store(5, Ordering::Relaxed);
+        REPORT_COUNT.store(2, Ordering::Relaxed);
         DROPPED_SAMPLES.store(3, Ordering::Relaxed);
         LAST_PPROF_ENCODE_ELAPSED_MICROS.store(11, Ordering::Relaxed);
 
@@ -1921,6 +1987,8 @@ mod tests {
             stats,
             MimallocStats {
                 recorded_samples: 7,
+                reported_samples: 5,
+                reports: 2,
                 flushes: 0,
                 flushed_samples: 0,
                 dropped_samples: 3,
@@ -1933,6 +2001,8 @@ mod tests {
         );
 
         RECORDED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+        REPORTED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
+        REPORT_COUNT.store(0, Ordering::Relaxed);
         FLUSH_COUNT.store(0, Ordering::Relaxed);
         FLUSHED_SAMPLE_COUNT.store(0, Ordering::Relaxed);
         DROPPED_SAMPLES.store(0, Ordering::Relaxed);

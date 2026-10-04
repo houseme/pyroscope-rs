@@ -94,9 +94,13 @@ jobs:
           restore-keys: |
             mimalloc-benchmark-history-${{ github.ref_name }}-
 
+      - name: Verify mimalloc benchmark quality classification
+        run: bash scripts/test_mimalloc_benchmark_report.sh
+
       - name: Generate mimalloc benchmark report
         env:
           MIMALLOC_BENCH_DURATION_MS: "1000"
+          MIMALLOC_BENCH_ENFORCE_QUALITY: "1"
         run: make mimalloc/bench/report
 
       - name: Upload mimalloc benchmark report

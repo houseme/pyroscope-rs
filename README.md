@@ -121,6 +121,9 @@ Useful local checks:
 ```bash
 cargo run --example mimalloc --features backend-mimalloc
 cargo run --release --example mimalloc_overhead --features backend-mimalloc
+MIMALLOC_BENCH_MODE=active MIMALLOC_BENCH_REPORT_INTERVAL_MS=50 \
+  MIMALLOC_BENCH_RING_CAPACITY=16384 \
+  cargo run --release --example mimalloc_overhead --features backend-mimalloc
 MIMALLOC_BENCH_MODE=live cargo run --release --example mimalloc_overhead --features backend-mimalloc
 make mimalloc/bench/report
 cargo test --locked --test mimalloc_backend --features backend-mimalloc -- --ignored
@@ -135,15 +138,30 @@ sampled allocation latency percentiles. Live heap scenarios at 1 MiB, 512 KiB,
 and 4 KiB sampling intervals also retain a working set through report creation.
 Their raw outputs include live sample counts, dropped live samples, and
 preallocated metadata payload bytes (excluding hash control bytes, shard
-headers, and allocator bookkeeping). Benchmark warnings are diagnostic;
-performance claims require repeat runs on an otherwise idle machine.
+headers, and allocator bookkeeping). Post-workload collection rows are pressure
+diagnostics: low overhead while dropping records is not lossless sampling cost.
+`steady-active-1m` and `steady-live-1m` drain a worker's TLS rings concurrently
+every 50 ms using a 16,384-record queue. Reports record completed report counts,
+drained allocation records, pending records, drop rate, and quality status.
+`MimallocStats::reported_samples` counts raw allocation records encoded before
+aggregation, not weighted bytes or live entries repeated across snapshots.
+`MIMALLOC_BENCH_ENFORCE_QUALITY=1` rejects steady rows with excessive drops,
+pending records, live drops, or no periodic report. The default record-drop
+budget is 1%, adjustable through `MIMALLOC_BENCH_MAX_DROP_PCT`.
+Benchmark warnings are diagnostic; performance claims also require stable,
+resource-isolated repeat runs. Final draining is excluded from workload timing,
+and a requested profile export contains the final report, not merged intervals.
 
 Latency sampling selects one pseudorandom allocation per window, covering the
 workload's size distribution instead of repeatedly timing the smallest size.
 Raw outputs include the sampling policy, sample count, and sampled size range.
-New history rows use `history/mimalloc-benchmark-history-v2.csv`; existing
+New history rows use `history/mimalloc-benchmark-history-v3.csv`; existing
 history files are retained. Earlier fixed-cadence latency percentiles should
 not be compared directly with the new stratified measurements.
+
+For offline report reclassification, set `MIMALLOC_BENCH_INPUT_DIR` to a saved
+ten-scenario raw-output directory. Replay does not run workloads or establish
+their source revision; its history rows use `replay-unknown`.
 
 ### Major Contributors
 

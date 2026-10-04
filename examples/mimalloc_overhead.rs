@@ -10,9 +10,38 @@ mod support;
 
 use pyroscope::backend::{
     mimalloc::{mimalloc_backend, mimalloc_stats, MimallocConfig, SamplingMiMalloc},
-    ReportData,
+    BackendImpl, BackendReady, ReportBatch, ReportData,
+};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 use support::{print_workload, run_workload, WorkloadConfig};
+
+#[derive(Default)]
+struct ReportMetrics {
+    elapsed: Duration,
+    maximum: Duration,
+    encoded_bytes: usize,
+    periodic_reports: u64,
+}
+
+impl ReportMetrics {
+    fn collect(
+        &mut self,
+        backend: &mut BackendImpl<BackendReady>,
+    ) -> pyroscope::error::Result<ReportBatch> {
+        let start = Instant::now();
+        let report = backend.report()?;
+        let elapsed = start.elapsed();
+        self.elapsed += elapsed;
+        self.maximum = self.maximum.max(elapsed);
+        if let ReportData::RawPprof(bytes) = &report.data {
+            self.encoded_bytes = self.encoded_bytes.saturating_add(bytes.len());
+        }
+        Ok(report)
+    }
+}
 
 #[global_allocator]
 static ALLOC: SamplingMiMalloc = SamplingMiMalloc::new();
@@ -32,10 +61,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let report_interval =
+        Duration::from_millis(read_env_u64("MIMALLOC_BENCH_REPORT_INTERVAL_MS", 0));
+    let ring_capacity = read_env_usize("MIMALLOC_BENCH_RING_CAPACITY", 512);
+    let report_drain_limit = read_env_usize("MIMALLOC_BENCH_REPORT_DRAIN_LIMIT", 1_000_000);
     let mut backend = mimalloc_backend(MimallocConfig {
         sample_interval_bytes: read_env_u64("MIMALLOC_BENCH_SAMPLE_INTERVAL", 1024 * 1024),
-        ring_capacity: read_env_usize("MIMALLOC_BENCH_RING_CAPACITY", 512),
-        report_drain_limit: read_env_usize("MIMALLOC_BENCH_REPORT_DRAIN_LIMIT", 1_000_000),
+        ring_capacity,
+        report_drain_limit,
         live_heap_tracking: live_heap,
         max_live_samples: read_env_usize("MIMALLOC_BENCH_MAX_LIVE_SAMPLES", 16_384),
         ..MimallocConfig::default()
@@ -52,14 +85,47 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
         Vec::new()
     };
 
-    let result = run_workload(config);
-    let report_start = std::time::Instant::now();
-    let report = backend.report()?;
-    let report_elapsed = report_start.elapsed();
-    let encoded_pprof_bytes = match &report.data {
-        ReportData::RawPprof(bytes) => bytes.len(),
-        ReportData::Reports(_) => 0,
+    let mut metrics = ReportMetrics::default();
+    let result = if report_interval.is_zero() {
+        run_workload(config)
+    } else {
+        // The workload owns its TLS ring; this thread drains it concurrently,
+        // just as the agent reporter does. Always join, including error paths.
+        std::thread::scope(|scope| -> Result<_, Box<dyn std::error::Error>> {
+            let (tx, rx) = mpsc::sync_channel(1);
+            let worker = scope.spawn(move || {
+                let result = run_workload(config);
+                let _ = tx.send(result);
+            });
+            let result = loop {
+                match rx.recv_timeout(report_interval) {
+                    Ok(result) => break result,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        metrics.collect(&mut backend)?;
+                        metrics.periodic_reports += 1;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        worker
+                            .join()
+                            .map_err(|_| std::io::Error::other("benchmark workload panicked"))?;
+                        return Err(std::io::Error::other("benchmark workload disconnected").into());
+                    }
+                }
+            };
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("benchmark workload panicked"))?;
+            Ok(result)
+        })?
     };
+    let mut report = metrics.collect(&mut backend)?;
+    // Respect small drain limits while bounding a misconfigured final drain.
+    for _ in 0..1024 {
+        if mimalloc_stats().buffered_samples == Some(0) {
+            break;
+        }
+        report = metrics.collect(&mut backend)?;
+    }
     let stats = mimalloc_stats();
 
     std::hint::black_box(&retained);
@@ -77,6 +143,12 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
         read_env_u64("MIMALLOC_BENCH_SAMPLE_INTERVAL", 1024 * 1024)
     );
     println!("recorded_samples={}", stats.recorded_samples);
+    println!("reported_samples={}", stats.reported_samples);
+    println!("reports={}", stats.reports);
+    println!("periodic_reports={}", metrics.periodic_reports);
+    println!("report_interval_ms={}", report_interval.as_millis());
+    println!("ring_capacity={ring_capacity}");
+    println!("report_drain_limit={report_drain_limit}");
     println!("flushes={}", stats.flushes);
     println!("flushed_samples={}", stats.flushed_samples);
     println!("dropped_samples={}", stats.dropped_samples);
@@ -93,8 +165,9 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
             .map(|samples| samples.to_string())
             .unwrap_or_else(|| "locked".to_string())
     );
-    println!("report_elapsed_ms={}", report_elapsed.as_millis());
-    println!("encoded_pprof_bytes={encoded_pprof_bytes}");
+    println!("report_elapsed_ms={}", metrics.elapsed.as_millis());
+    println!("report_max_elapsed_us={}", metrics.maximum.as_micros());
+    println!("encoded_pprof_bytes={}", metrics.encoded_bytes);
     println!(
         "pprof_encode_elapsed_us={}",
         stats.last_pprof_encode_elapsed_micros
