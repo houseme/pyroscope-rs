@@ -95,6 +95,13 @@ debug = 1
 strip = "none"
 ```
 
+On Linux glibc, `MimallocConfig::stack_capture` can select
+`MimallocStackCapture::Native`. It collects raw return addresses through the
+MT-Safe libc interface without taking backtrace-rs's shared lock, and warms the
+unwinder before recording starts. Symbolization remains in `report()`. The
+portable engine stays the default: native capture is not universally faster,
+and initialization rejects it on musl, Apple, Windows, and other targets.
+
 On Linux and Apple platforms, reports include executable mappings, file offsets,
 and available build IDs (GNU build IDs or Mach-O UUIDs). Linux offsets are read
 only from ELF files whose build ID matches the loaded image; unavailable or
@@ -155,13 +162,20 @@ and a requested profile export contains the final report, not merged intervals.
 Latency sampling selects one pseudorandom allocation per window, covering the
 workload's size distribution instead of repeatedly timing the smallest size.
 Raw outputs include the sampling policy, sample count, and sampled size range.
-New history rows use `history/mimalloc-benchmark-history-v3.csv`; existing
+New history rows use `history/mimalloc-benchmark-history-v4.csv`; existing
 history files are retained. Earlier fixed-cadence latency percentiles should
 not be compared directly with the new stratified measurements.
 
 For offline report reclassification, set `MIMALLOC_BENCH_INPUT_DIR` to a saved
 ten-scenario raw-output directory. Replay does not run workloads or establish
 their source revision; its history rows use `replay-unknown`.
+
+For same-process concurrent capture comparisons, the overhead example supports
+`MIMALLOC_BENCH_WORKERS=2` (up to 64) with a positive report interval and
+`MIMALLOC_BENCH_STACK_CAPTURE=portable` or `native`. Workers start together;
+throughput totals all workers over the common wall-clock interval, while latency
+percentiles describe only the first worker. The standard baseline report stays
+single-worker, and v4 history records the capture engine and worker count.
 
 ### Major Contributors
 

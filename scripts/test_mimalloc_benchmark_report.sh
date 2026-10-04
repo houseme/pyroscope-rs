@@ -13,7 +13,7 @@ fixture() {
         'allocation_latency_samples=10' 'allocation_latency_min_size=64' 'allocation_latency_max_size=65536' \
         'sample_interval_bytes=1048576' 'recorded_samples=1000' 'reports=4' \
         "reported_samples=$reported" "dropped_samples=$dropped" "buffered_samples=$pending" \
-        "periodic_reports=$periodic" "dropped_live_samples=$live_drops" 'report_interval_ms=50' \
+        "periodic_reports=$periodic" "dropped_live_samples=$live_drops" 'report_interval_ms=50' 'stack_capture=Portable' \
         > "$tmp/inputs/$scenario.env"
 }
 
@@ -33,8 +33,9 @@ run_report() {
 }
 
 run_report
-history="$tmp/output/history/mimalloc-benchmark-history-v3.csv"
-awk -F, 'NF != 34 { exit 1 } END { if (NR != 11) exit 1 }' "$history"
+history="$tmp/output/history/mimalloc-benchmark-history-v4.csv"
+awk -F, 'NF != 36 { exit 1 } END { if (NR != 11) exit 1 }' "$history"
+awk -F, '$5 == "steady-active-1m" && $35 == "Portable" { good=1 } END { exit !good }' "$history"
 awk -F, '$5 == "active-1m" && $19 == "QUALITY_WARN" && $32 == "99.000000" && $33 == "LOSSY" { good=1 } END { exit !good }' "$history"
 for quality in UNKNOWN_OR_EMPTY PENDING LIVE_DROPS; do
     awk -F, -v expected="$quality" '$33 == expected { good=1 } END { exit !good }' "$history"

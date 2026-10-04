@@ -51,6 +51,7 @@ const MAX_POISSON_INTERVALS_PER_ALLOCATION: u64 = 64;
 static RECORDER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BACKEND_CLAIMED: AtomicBool = AtomicBool::new(false);
 static CAPTURE_DEPTH: AtomicUsize = AtomicUsize::new(MAX_CAPTURE_DEPTH);
+static NATIVE_STACK_CAPTURE: AtomicBool = AtomicBool::new(false);
 static ALLOCATOR_SEEN: AtomicBool = AtomicBool::new(false);
 static SAMPLE_INTERVAL_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_SAMPLE_INTERVAL_BYTES);
 static SAMPLING_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -135,6 +136,14 @@ impl Hash for StackKey {
 
 impl StackKey {
     fn capture(max_depth: usize) -> Self {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        if NATIVE_STACK_CAPTURE.load(Ordering::Relaxed) {
+            return Self::capture_native(max_depth);
+        }
+        Self::capture_portable(max_depth)
+    }
+
+    fn capture_portable(max_depth: usize) -> Self {
         let mut key = Self {
             frames: [0; MAX_CAPTURE_DEPTH],
             depth: 0,
@@ -150,6 +159,28 @@ impl StackKey {
             true
         });
 
+        key
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn capture_native(max_depth: usize) -> Self {
+        let limit = max_depth.min(MAX_CAPTURE_DEPTH);
+        let mut key = Self {
+            frames: [0; MAX_CAPTURE_DEPTH],
+            depth: 0,
+        };
+        if limit == 0 {
+            return key;
+        }
+        let mut addresses = [std::ptr::null_mut::<std::ffi::c_void>(); MAX_CAPTURE_DEPTH];
+        // SAFETY: glibc backtrace is MT-Safe, writes at most limit pointers to
+        // this writable array, and never retains it. No callback or symbols
+        // are invoked here. Initialization warms its lazy unwinder loading.
+        let count = unsafe { libc::backtrace(addresses.as_mut_ptr(), limit as libc::c_int) };
+        key.depth = usize::try_from(count).unwrap_or(0).min(limit);
+        for (output, address) in key.frames[..key.depth].iter_mut().zip(&addresses) {
+            *output = *address as usize;
+        }
         key
     }
 
@@ -301,8 +332,8 @@ struct AggregatedAllocationSample {
 /// data with `alloc_objects/count` and `alloc_space/bytes` sample types. Enabling
 /// `live_heap_tracking` adds `inuse_objects/count` and `inuse_space/bytes`, with
 /// `inuse_space` selected by default, matching jemalloc's live heap view.
-/// Samples whose frames
-/// cannot be resolved are grouped under a synthetic fallback frame.
+/// Unresolved physical addresses remain available for downstream symbolization;
+/// a synthetic fallback is used only when no usable frame remains.
 ///
 /// # Examples
 ///
@@ -328,6 +359,9 @@ pub struct MimallocConfig {
     pub sample_interval_bytes: u64,
     /// Maximum number of stack frames captured for each sampled allocation.
     pub max_depth: usize,
+    /// Stack capture engine. Portable is the default; Native is an opt-in
+    /// Linux glibc raw-address collector without backtrace-rs's shared lock.
+    pub stack_capture: MimallocStackCapture,
     /// Maximum number of samples retained in the global recorder between reports.
     ///
     /// If the recorder is full or contended, new samples are dropped rather than
@@ -355,6 +389,17 @@ pub struct MimallocConfig {
     /// `MimallocStats::dropped_live_samples`. Independent of `ring_capacity` and
     /// `report_drain_limit`; live snapshots always include every retained entry.
     pub max_live_samples: usize,
+}
+
+/// Raw stack capture engine used only on sampling hits.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+pub enum MimallocStackCapture {
+    /// Synchronized backtrace-rs collector, available on supported platforms.
+    #[default]
+    Portable,
+    /// MT-Safe glibc backtrace collector into a fixed buffer. Linux GNU only;
+    /// initialization rejects this mode elsewhere rather than silently falling back.
+    Native,
 }
 
 /// Runtime counters for the mimalloc memory profiling backend.
@@ -417,6 +462,7 @@ impl Default for MimallocConfig {
         Self {
             sample_interval_bytes: DEFAULT_SAMPLE_INTERVAL_BYTES,
             max_depth: DEFAULT_MAX_DEPTH,
+            stack_capture: MimallocStackCapture::Portable,
             ring_capacity: DEFAULT_RING_CAPACITY,
             report_drain_limit: DEFAULT_REPORT_DRAIN_LIMIT,
             live_heap_tracking: false,
@@ -427,6 +473,13 @@ impl Default for MimallocConfig {
 
 impl MimallocConfig {
     fn validate(&self) -> Result<()> {
+        if self.stack_capture == MimallocStackCapture::Native
+            && !cfg!(all(target_os = "linux", target_env = "gnu"))
+        {
+            return Err(PyroscopeError::new(
+                "mimalloc: native stack capture requires Linux glibc",
+            ));
+        }
         if self.sample_interval_bytes == 0 {
             return Err(PyroscopeError::new(
                 "mimalloc: sample_interval_bytes must be greater than zero",
@@ -641,6 +694,10 @@ impl Backend for Mimalloc {
                     .max_depth
                     .saturating_add(PROFILER_FRAME_ALLOWANCE)
                     .min(MAX_CAPTURE_DEPTH),
+                Ordering::Relaxed,
+            );
+            NATIVE_STACK_CAPTURE.store(
+                self.config.stack_capture == MimallocStackCapture::Native,
                 Ordering::Relaxed,
             );
             NEXT_RECORDED_SAMPLE_SHARD.store(0, Ordering::Relaxed);
@@ -1595,6 +1652,11 @@ fn is_mimalloc_profiler_frame(name: &str) -> bool {
 }
 
 fn warm_backtrace() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if NATIVE_STACK_CAPTURE.load(Ordering::Relaxed) {
+        let _ = StackKey::capture_native(2);
+        return;
+    }
     let mut frames = 0;
     backtrace::trace(|_frame| {
         frames += 1;
@@ -1681,6 +1743,45 @@ mod tests {
     #[test]
     fn mimalloc_config_default_is_valid() {
         assert!(MimallocConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn native_stack_capture_configuration_matches_target_support() {
+        let config = MimallocConfig {
+            stack_capture: MimallocStackCapture::Native,
+            ..MimallocConfig::default()
+        };
+        assert_eq!(
+            config.validate().is_ok(),
+            cfg!(all(target_os = "linux", target_env = "gnu"))
+        );
+        assert_eq!(
+            MimallocConfig::default().stack_capture,
+            MimallocStackCapture::Portable
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn native_stack_capture_is_bounded_and_reentrant_across_threads() {
+        for depth in [1, 16, 64, 128] {
+            let captured = StackKey::capture_native(depth);
+            assert!(captured.depth > 0 && captured.depth <= depth.min(MAX_CAPTURE_DEPTH));
+            assert!(captured.iter().all(|address| address != 0));
+        }
+        assert_eq!(StackKey::capture_native(0).depth, 0);
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..100 {
+                        assert!(StackKey::capture_native(16).depth > 0);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]

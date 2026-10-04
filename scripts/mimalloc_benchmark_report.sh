@@ -4,8 +4,8 @@ set -euo pipefail
 output_dir="${MIMALLOC_BENCH_OUTPUT_DIR:-target/mimalloc-benchmark}"
 report_path="${MIMALLOC_BENCH_REPORT:-${output_dir}/mimalloc-benchmark-report.md}"
 history_dir="${MIMALLOC_BENCH_HISTORY_DIR:-${output_dir}/history}"
-history_path="${MIMALLOC_BENCH_HISTORY:-${history_dir}/mimalloc-benchmark-history-v3.csv}"
-history_header="timestamp_utc,run_id,run_attempt,commit,scenario,sample_interval_bytes,mib_per_sec,allocations_per_sec,overhead_vs_baseline_pct,recorded_samples,flushes,dropped_samples,report_elapsed_ms,encoded_pprof_bytes,pprof_encode_elapsed_us,allocation_latency_p50_ns,allocation_latency_p95_ns,allocation_latency_p99_ns,status,latency_sampling_policy,allocation_latency_samples,allocation_latency_min_size,allocation_latency_max_size,report_interval_ms,ring_capacity,report_drain_limit,reports,reported_samples,periodic_reports,buffered_samples,dropped_live_samples,allocation_record_drop_pct,quality_status,report_max_elapsed_us"
+history_path="${MIMALLOC_BENCH_HISTORY:-${history_dir}/mimalloc-benchmark-history-v4.csv}"
+history_header="timestamp_utc,run_id,run_attempt,commit,scenario,sample_interval_bytes,mib_per_sec,allocations_per_sec,overhead_vs_baseline_pct,recorded_samples,flushes,dropped_samples,report_elapsed_ms,encoded_pprof_bytes,pprof_encode_elapsed_us,allocation_latency_p50_ns,allocation_latency_p95_ns,allocation_latency_p99_ns,status,latency_sampling_policy,allocation_latency_samples,allocation_latency_min_size,allocation_latency_max_size,report_interval_ms,ring_capacity,report_drain_limit,reports,reported_samples,periodic_reports,buffered_samples,dropped_live_samples,allocation_record_drop_pct,quality_status,report_max_elapsed_us,stack_capture,workers"
 enforce_thresholds="${MIMALLOC_BENCH_ENFORCE_THRESHOLDS:-0}"
 enforce_quality="${MIMALLOC_BENCH_ENFORCE_QUALITY:-0}"
 input_dir="${MIMALLOC_BENCH_INPUT_DIR:-}"
@@ -39,6 +39,9 @@ export MIMALLOC_BENCH_MAX_SIZE
 export MIMALLOC_BENCH_SIZE_STEP
 export MIMALLOC_BENCH_LATENCY_SAMPLE_INTERVAL
 export MIMALLOC_BENCH_LATENCY_SAMPLE_LIMIT
+# The bare allocator baseline is single-worker; do not compare it to a
+# multi-worker profiler run. Multi-worker A/B runs use the overhead example directly.
+export MIMALLOC_BENCH_WORKERS=1
 
 mkdir -p "$output_dir"
 mkdir -p "$history_dir"
@@ -57,7 +60,7 @@ fi
 ensure_history_header() {
     if [ -f "$history_path" ]; then
         if ! IFS= read -r existing_header < "$history_path" || [ "$existing_header" != "$history_header" ]; then
-            echo "incompatible benchmark history schema: $history_path; use a new v3 history file" >&2
+            echo "incompatible benchmark history schema: $history_path; use a new v4 history file" >&2
             exit 1
         fi
         return
@@ -151,7 +154,7 @@ append_row() {
     local allocation_latency_min_size
     local allocation_latency_max_size
     local report_interval ring_capacity report_drain_limit reports reported_samples periodic_reports
-    local buffered_samples dropped_live_samples record_drop_pct quality_status report_max_elapsed_us
+    local buffered_samples dropped_live_samples record_drop_pct quality_status report_max_elapsed_us stack_capture workers
 
     sample_interval="$(metric_or_default "$file" sample_interval_bytes "-")"
     mib_per_sec="$(metric "$file" mib_per_sec)"
@@ -178,6 +181,8 @@ append_row() {
     buffered_samples="$(metric_or_default "$file" buffered_samples "unknown")"
     dropped_live_samples="$(metric_or_default "$file" dropped_live_samples "-")"
     report_max_elapsed_us="$(metric_or_default "$file" report_max_elapsed_us "-")"
+    stack_capture="$(metric_or_default "$file" stack_capture "unknown")"
+    workers="$(metric_or_default "$file" workers "1")"
     record_drop_pct="-"
     quality_status="N/A"
     if [ "$scenario" != "baseline" ] && [ "$scenario" != "inactive" ]; then
@@ -246,7 +251,7 @@ append_row() {
         "$quality_status" \
         "$status" >> "$report_path"
 
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$history_timestamp" \
         "$history_run_id" \
         "$history_run_attempt" \
@@ -272,7 +277,7 @@ append_row() {
         "$allocation_latency_max_size" \
         "$report_interval" "$ring_capacity" "$report_drain_limit" "$reports" "$reported_samples" \
         "$periodic_reports" "$buffered_samples" "$dropped_live_samples" \
-        "$record_drop_pct" "$quality_status" "$report_max_elapsed_us" >> "$history_path"
+        "$record_drop_pct" "$quality_status" "$report_max_elapsed_us" "$stack_capture" "$workers" >> "$history_path"
 }
 
 ensure_history_header
@@ -356,12 +361,12 @@ append_row "steady-live-1m" "${output_dir}/steady-live-1m.env" "$baseline_mib_pe
     echo "- live-4k.env"
     echo "- steady-active-1m.env"
     echo "- steady-live-1m.env"
-    echo "- history/mimalloc-benchmark-history-v3.csv"
+    echo "- history/mimalloc-benchmark-history-v4.csv"
     echo
     echo "Live heap raw outputs include live_samples, dropped_live_samples, and live_metadata_payload_bytes."
     echo "Payload bytes exclude hash control bytes, shard headers, and allocator bookkeeping."
     echo "Latency samples use stratified_v1: one pseudorandom allocation per window."
-    echo "Raw outputs and v3 history include report cadence, queue/drain capacity, completed reports, drained records, pending records, live drops, and quality status."
+    echo "Raw outputs and v4 history include report cadence, queue/drain capacity, completed reports, drained records, pending records, live drops, quality status, and stack capture engine."
     echo "Drop rate is dropped / (reported + pending + dropped), measured after the workload joins; raw record counts are not weighted-byte coverage."
     echo "Replay mode uses MIMALLOC_BENCH_INPUT_DIR and does not run workloads."
     echo "Steady report duration and encoded bytes are totals over all reports; pprof_encode_elapsed_us remains the last report's encoding time."

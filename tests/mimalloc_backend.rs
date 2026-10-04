@@ -22,6 +22,48 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn native_capture_preserves_user_frames_source_metadata_and_live_lifecycle() {
+        use pyroscope::backend::mimalloc::MimallocStackCapture;
+        let _guard = TEST_LOCK.lock().unwrap();
+        let mut backend = mimalloc_backend(MimallocConfig {
+            stack_capture: MimallocStackCapture::Native,
+            sample_interval_bytes: 1024,
+            live_heap_tracking: true,
+            ..MimallocConfig::default()
+        })
+        .initialize()
+        .unwrap();
+        let retained = allocate_retained_live_test(2 * 1024 * 1024);
+        let profile = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&profile, "allocate_retained_live_test", "inuse_space"),
+            retained.len() as i64
+        );
+        let function = profile
+            .function
+            .iter()
+            .find(|function| {
+                profile.string_table[function.name as usize].contains("allocate_retained_live_test")
+            })
+            .unwrap();
+        assert!(profile.string_table[function.filename as usize].ends_with("mimalloc_backend.rs"));
+        assert!(profile.location.iter().any(|location| location.address != 0
+            && location.mapping_id != 0
+            && location
+                .line
+                .iter()
+                .any(|line| line.function_id == function.id && line.line > 0)));
+        std::thread::spawn(move || drop(retained)).join().unwrap();
+        let freed = report_profile(&mut backend);
+        assert_eq!(
+            sample_value_for_frame(&freed, "allocate_retained_live_test", "inuse_space"),
+            0
+        );
+        backend.shutdown().unwrap();
+    }
+
     #[test]
     fn live_heap_report_preserves_source_metadata_through_http_upload() {
         use pyroscope::{

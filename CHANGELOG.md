@@ -10,6 +10,7 @@
 - Include executable mappings and build IDs in mimalloc reports on Linux and Apple platforms, with verified ELF file offsets and conservative symbolization flags. Collect metadata only during reporting and use indexed address lookup without adding allocator-hook work.
 - Normalize Rust symbol display names before removing profiler frames, preserve original pprof system names, and share filtered inline frames across stacks. Keep unresolved addresses eligible for downstream symbolization instead of creating fake address-named functions.
 - Expose completed mimalloc report and drained allocation-record counters. Add concurrent periodic-report benchmark scenarios, record-drop quality gates, replay classification regressions, and versioned v3 history without treating pressure-drop throughput as lossless profiling overhead.
+- Add opt-in Linux glibc native raw stack capture, warmed before sampling, without the backtrace-rs shared lock. Keep portable capture as the default and reject unsupported targets. Add synchronized multi-worker comparisons and v4 history identifying capture engines and worker counts.
 
 
 ## [2.1.1](https://github.com/grafana/pyroscope-rs/compare/lib-2.1.0...lib-2.1.1) (2026-07-21)

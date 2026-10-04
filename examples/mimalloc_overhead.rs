@@ -9,11 +9,13 @@
 mod support;
 
 use pyroscope::backend::{
-    mimalloc::{mimalloc_backend, mimalloc_stats, MimallocConfig, SamplingMiMalloc},
+    mimalloc::{
+        mimalloc_backend, mimalloc_stats, MimallocConfig, MimallocStackCapture, SamplingMiMalloc,
+    },
     BackendImpl, BackendReady, ReportBatch, ReportData,
 };
 use std::{
-    sync::mpsc,
+    sync::{mpsc, Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 use support::{print_workload, run_workload, WorkloadConfig};
@@ -65,10 +67,28 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
         Duration::from_millis(read_env_u64("MIMALLOC_BENCH_REPORT_INTERVAL_MS", 0));
     let ring_capacity = read_env_usize("MIMALLOC_BENCH_RING_CAPACITY", 512);
     let report_drain_limit = read_env_usize("MIMALLOC_BENCH_REPORT_DRAIN_LIMIT", 1_000_000);
+    let workers = read_env_usize("MIMALLOC_BENCH_WORKERS", 1);
+    if !(1..=64).contains(&workers) || (workers > 1 && report_interval.is_zero()) {
+        return Err(std::io::Error::other(
+            "benchmark workers must be 1..64; multiple workers require periodic reporting",
+        )
+        .into());
+    }
+    let stack_capture = match std::env::var("MIMALLOC_BENCH_STACK_CAPTURE").as_deref() {
+        Ok("native") => MimallocStackCapture::Native,
+        Ok("portable") | Err(_) => MimallocStackCapture::Portable,
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "unknown MIMALLOC_BENCH_STACK_CAPTURE; use portable or native",
+            )
+            .into())
+        }
+    };
     let mut backend = mimalloc_backend(MimallocConfig {
         sample_interval_bytes: read_env_u64("MIMALLOC_BENCH_SAMPLE_INTERVAL", 1024 * 1024),
         ring_capacity,
         report_drain_limit,
+        stack_capture,
         live_heap_tracking: live_heap,
         max_live_samples: read_env_usize("MIMALLOC_BENCH_MAX_LIVE_SAMPLES", 16_384),
         ..MimallocConfig::default()
@@ -92,29 +112,82 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
         // The workload owns its TLS ring; this thread drains it concurrently,
         // just as the agent reporter does. Always join, including error paths.
         std::thread::scope(|scope| -> Result<_, Box<dyn std::error::Error>> {
-            let (tx, rx) = mpsc::sync_channel(1);
-            let worker = scope.spawn(move || {
-                let result = run_workload(config);
-                let _ = tx.send(result);
-            });
-            let result = loop {
+            let (tx, rx) = mpsc::sync_channel(workers);
+            let start_gate = Arc::new((Mutex::new(None::<bool>), Condvar::new()));
+            let mut handles = Vec::with_capacity(workers);
+            for index in 0..workers {
+                let tx = tx.clone();
+                let gate = Arc::clone(&start_gate);
+                let handle = std::thread::Builder::new().spawn_scoped(scope, move || {
+                    let mut config = config;
+                    if index != 0 {
+                        config.latency_sample_interval = 0;
+                    }
+                    let started = gate
+                        .1
+                        .wait_while(gate.0.lock().unwrap(), |state| state.is_none())
+                        .unwrap();
+                    if *started != Some(true) {
+                        return;
+                    }
+                    drop(started);
+                    let result = run_workload(config);
+                    let _ = tx.send((index, result));
+                });
+                match handle {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        // Release already-created workers without running the
+                        // workload; a failed spawn must not strand a barrier.
+                        *start_gate.0.lock().unwrap() = Some(false);
+                        start_gate.1.notify_all();
+                        return Err(error.into());
+                    }
+                }
+            }
+            drop(tx);
+            let start = Instant::now();
+            *start_gate.0.lock().unwrap() = Some(true);
+            start_gate.1.notify_all();
+            let mut remaining = workers;
+            let mut first = None;
+            let mut allocations = 0_u64;
+            let mut bytes = 0_u64;
+            while remaining > 0 {
                 match rx.recv_timeout(report_interval) {
-                    Ok(result) => break result,
+                    Ok((index, result)) => {
+                        allocations = allocations.saturating_add(result.allocations);
+                        bytes = bytes.saturating_add(result.bytes);
+                        if index == 0 {
+                            first = Some(result);
+                        }
+                        remaining -= 1;
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         metrics.collect(&mut backend)?;
                         metrics.periodic_reports += 1;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        worker
-                            .join()
-                            .map_err(|_| std::io::Error::other("benchmark workload panicked"))?;
+                        for worker in handles {
+                            worker.join().map_err(|_| {
+                                std::io::Error::other("benchmark workload panicked")
+                            })?;
+                        }
                         return Err(std::io::Error::other("benchmark workload disconnected").into());
                     }
                 }
-            };
-            worker
-                .join()
-                .map_err(|_| std::io::Error::other("benchmark workload panicked"))?;
+            }
+            let elapsed = start.elapsed();
+            for worker in handles {
+                worker
+                    .join()
+                    .map_err(|_| std::io::Error::other("benchmark workload panicked"))?;
+            }
+            let mut result =
+                first.ok_or_else(|| std::io::Error::other("benchmark first worker missing"))?;
+            result.allocations = allocations;
+            result.bytes = bytes;
+            result.elapsed = elapsed;
             Ok(result)
         })?
     };
@@ -148,6 +221,9 @@ fn run_active(config: WorkloadConfig, live_heap: bool) -> Result<(), Box<dyn std
     println!("periodic_reports={}", metrics.periodic_reports);
     println!("report_interval_ms={}", report_interval.as_millis());
     println!("ring_capacity={ring_capacity}");
+    println!("workers={workers}");
+    println!("latency_scope=first_worker");
+    println!("stack_capture={stack_capture:?}");
     println!("report_drain_limit={report_drain_limit}");
     println!("flushes={}", stats.flushes);
     println!("flushed_samples={}", stats.flushed_samples);
